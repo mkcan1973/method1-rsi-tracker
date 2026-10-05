@@ -123,7 +123,7 @@ STYLE = """
   footer { color: var(--ink-muted); font-size: 0.78rem; margin-top: 36px; border-top: 1px solid var(--border);
            padding-top: 14px; }
 
-  #tooltip { position: absolute; pointer-events: none; background: var(--ink-1); color: var(--bg-page);
+  .tooltip { position: absolute; pointer-events: none; background: var(--ink-1); color: var(--bg-page);
              font-size: 0.78rem; padding: 6px 9px; border-radius: 6px; opacity: 0; transition: opacity 0.1s;
              font-family: "IBM Plex Mono", monospace; white-space: nowrap; z-index: 10; }
 </style>
@@ -179,20 +179,17 @@ def _svg_equity_chart(curve: list[dict]) -> str:
         <path d="{path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
         <circle cx="{pts[-1][0]:.1f}" cy="{pts[-1][1]:.1f}" r="4" fill="var(--accent)"/>
         <g id="eqHover">{dots}</g>
-        <line id="crosshair" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
+        <line id="crosshair-eq" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
               stroke-width="1" stroke-dasharray="3,3" style="opacity:0;"/>
       </svg>
-      <div id="tooltip"></div>
+      <div id="tooltip-eq" class="tooltip"></div>
     </div>
     <script>
       (function() {{
         var dates = {dates_json};
         var vals = {vals_json};
-        var svg = document.currentScript.previousElementSibling.querySelector('svg')
-                  || document.getElementById('eqHover').closest('svg');
-        var tooltip = document.getElementById('tooltip');
-        var crosshair = document.getElementById('crosshair');
-        var container = document.getElementById('eqHover').closest('div[style]');
+        var tooltip = document.getElementById('tooltip-eq');
+        var crosshair = document.getElementById('crosshair-eq');
         document.querySelectorAll('.eqdot').forEach(function(dot) {{
           dot.addEventListener('mouseenter', function() {{
             var i = parseInt(dot.getAttribute('data-i'), 10);
@@ -200,6 +197,106 @@ def _svg_equity_chart(curve: list[dict]) -> str:
             var cx = dot.cx.baseVal.value / {W} * rect.width;
             var cy = dot.cy.baseVal.value / {H} * rect.height;
             tooltip.textContent = dates[i] + '  $' + vals[i].toLocaleString('en-US', {{maximumFractionDigits:0}});
+            tooltip.style.left = (cx + 10) + 'px';
+            tooltip.style.top = (cy - 28) + 'px';
+            tooltip.style.opacity = 1;
+            crosshair.setAttribute('x1', dot.cx.baseVal.value);
+            crosshair.setAttribute('x2', dot.cx.baseVal.value);
+            crosshair.style.opacity = 1;
+          }});
+          dot.addEventListener('mouseleave', function() {{
+            tooltip.style.opacity = 0;
+            crosshair.style.opacity = 0;
+          }});
+        }});
+      }})();
+    </script>
+    """
+
+
+def _svg_unrealized_chart(open_rows: list[dict]) -> str:
+    """Scatter of unrealized ROI vs. entry order for currently-open
+    positions: oldest open entry on the left (max days in trade), most
+    recent on the right. Newer entries haven't had time to move from
+    entry, so the right edge necessarily clusters near 0% -- the rolling-
+    average line makes that narrowing visible instead of just implied.
+    """
+    if len(open_rows) < 2:
+        return '<p class="chart-note">Not enough open positions to chart.</p>'
+
+    rows = sorted(open_rows, key=lambda r: r["entry_date"])
+    n = len(rows)
+    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1040, 260, 56, 16, 16, 28
+    vals = [r["roi"] for r in rows]
+    lo, hi = min(vals + [0]), max(vals + [0])
+    pad = (hi - lo) * 0.08 or 1
+    lo, hi = lo - pad, hi + pad
+    span = hi - lo
+
+    def x(i):
+        return PAD_L + (W - PAD_L - PAD_R) * i / (n - 1)
+
+    def y(v):
+        return PAD_T + (H - PAD_T - PAD_B) * (1 - (v - lo) / span)
+
+    pts = [(x(i), y(r["roi"])) for i, r in enumerate(rows)]
+    zero_y = y(0)
+
+    # Centered rolling average (window scales with n, min 5) to show the
+    # flattening trend without claiming false precision on tiny samples.
+    window = max(5, n // 12)
+    roll = []
+    for i in range(n):
+        lo_i, hi_i = max(0, i - window // 2), min(n, i + window // 2 + 1)
+        roll.append(sum(vals[lo_i:hi_i]) / (hi_i - lo_i))
+    roll_path = "M " + " L ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(roll))
+
+    gridlines = ""
+    for frac in (0, 0.25, 0.5, 0.75, 1):
+        gy = PAD_T + (H - PAD_T - PAD_B) * frac
+        val = hi - span * frac
+        gridlines += (f'<line x1="{PAD_L}" y1="{gy:.1f}" x2="{W-PAD_R}" y2="{gy:.1f}" '
+                      f'stroke="var(--grid)" stroke-width="1"/>'
+                      f'<text x="{PAD_L-8}" y="{gy+3:.1f}" text-anchor="end" font-size="10" '
+                      f'fill="var(--ink-muted)" class="num">{val:+.0f}%</text>')
+
+    dots_visible = "".join(
+        f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" '
+        f'fill="{"var(--good)" if r["roi"] >= 0 else "var(--critical)"}" opacity="0.75"/>'
+        for (px, py), r in zip(pts, rows)
+    )
+    dots_hover = "".join(
+        f'<circle class="urdot" data-i="{i}" cx="{px:.1f}" cy="{py:.1f}" r="7" fill="transparent"/>'
+        for i, (px, py) in enumerate(pts)
+    )
+
+    labels_json = json.dumps([f'{r["symbol"]} · entered {r["entry_date"]} · {r["hold_days"]}d · {r["roi"]:+.1f}%' for r in rows])
+
+    return f"""
+    <div style="position:relative;">
+      <svg viewBox="0 0 {W} {H}" style="width:100%; height:auto; display:block;">
+        {gridlines}
+        <line x1="{PAD_L}" y1="{zero_y:.1f}" x2="{W-PAD_R}" y2="{zero_y:.1f}" stroke="var(--baseline)" stroke-width="1"/>
+        <path d="{roll_path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" opacity="0.85"/>
+        <g>{dots_visible}</g>
+        <g id="urHover">{dots_hover}</g>
+        <line id="crosshair-ur" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
+              stroke-width="1" stroke-dasharray="3,3" style="opacity:0;"/>
+      </svg>
+      <div id="tooltip-ur" class="tooltip"></div>
+    </div>
+    <script>
+      (function() {{
+        var labels = {labels_json};
+        var tooltip = document.getElementById('tooltip-ur');
+        var crosshair = document.getElementById('crosshair-ur');
+        document.querySelectorAll('.urdot').forEach(function(dot) {{
+          dot.addEventListener('mouseenter', function() {{
+            var i = parseInt(dot.getAttribute('data-i'), 10);
+            var rect = dot.closest('svg').getBoundingClientRect();
+            var cx = dot.cx.baseVal.value / {W} * rect.width;
+            var cy = dot.cy.baseVal.value / {H} * rect.height;
+            tooltip.textContent = labels[i];
             tooltip.style.left = (cx + 10) + 'px';
             tooltip.style.top = (cy - 28) + 'px';
             tooltip.style.opacity = 1;
@@ -362,6 +459,14 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
   <div class="panel">
     {_svg_equity_chart(equity_curve)}
     <div class="chart-note">Running total of normalized ($1,000/trade) realized P&amp;L across closed trades, by exit date.</div>
+  </div>
+
+  <h2>Unrealized P&amp;L (open positions)</h2>
+  <div class="panel">
+    {_svg_unrealized_chart(open_rows)}
+    <div class="chart-note">Each dot is one open position's current ROI, ordered left-to-right by entry date (oldest / most days
+      in trade on the left, most recently entered on the right). The line is a rolling average &mdash; newer entries haven't had
+      time to move from entry, so the right edge naturally flattens toward 0%.</div>
   </div>
 
   {_table_section("Open positions", open_rows, "open")}
