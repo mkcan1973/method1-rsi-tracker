@@ -31,6 +31,19 @@ def _equity_curve(df: pd.DataFrame) -> list[dict]:
     ]
 
 
+def _unrealized_cumulative_curve(df: pd.DataFrame) -> list[dict]:
+    """Running total of unrealized $ P&L (normalized to $1,000/position),
+    in entry order -- the rightmost point is today's total unrealized P&L
+    across every currently-open position.
+    """
+    open_ = df[df["status"] == "open"].sort_values("entry_date")
+    cum = (open_["roi"] * 1000).cumsum()
+    return [
+        {"date": d.strftime("%Y-%m-%d"), "cum_pnl": round(c, 2)}
+        for d, c in zip(open_["entry_date"], cum)
+    ]
+
+
 def _rows_for_js(df: pd.DataFrame, status: str) -> list[dict]:
     sub = df[df["status"] == status].copy()
     out = []
@@ -132,9 +145,9 @@ STYLE = """
 HEAD_LINK = '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">'
 
 
-def _svg_equity_chart(curve: list[dict]) -> str:
+def _svg_equity_chart(curve: list[dict], chart_id: str = "eq", empty_msg: str = "Not enough data to chart yet.") -> str:
     if len(curve) < 2:
-        return '<p class="chart-note">Not enough closed trades yet to chart an equity curve.</p>'
+        return f'<p class="chart-note">{empty_msg}</p>'
 
     W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1040, 260, 56, 16, 16, 28
     vals = [p["cum_pnl"] for p in curve]
@@ -163,7 +176,7 @@ def _svg_equity_chart(curve: list[dict]) -> str:
                       f'fill="var(--ink-muted)" class="num">${val:,.0f}</text>')
 
     dots = "".join(
-        f'<circle class="eqdot" data-i="{i}" cx="{px:.1f}" cy="{py:.1f}" r="7" fill="transparent"/>'
+        f'<circle class="eqdot-{chart_id}" data-i="{i}" cx="{px:.1f}" cy="{py:.1f}" r="7" fill="transparent"/>'
         for i, (px, py) in enumerate(pts)
     )
 
@@ -178,125 +191,25 @@ def _svg_equity_chart(curve: list[dict]) -> str:
         <path d="{area}" fill="var(--accent)" opacity="0.12"/>
         <path d="{path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
         <circle cx="{pts[-1][0]:.1f}" cy="{pts[-1][1]:.1f}" r="4" fill="var(--accent)"/>
-        <g id="eqHover">{dots}</g>
-        <line id="crosshair-eq" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
+        <g id="eqHover-{chart_id}">{dots}</g>
+        <line id="crosshair-{chart_id}" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
               stroke-width="1" stroke-dasharray="3,3" style="opacity:0;"/>
       </svg>
-      <div id="tooltip-eq" class="tooltip"></div>
+      <div id="tooltip-{chart_id}" class="tooltip"></div>
     </div>
     <script>
       (function() {{
         var dates = {dates_json};
         var vals = {vals_json};
-        var tooltip = document.getElementById('tooltip-eq');
-        var crosshair = document.getElementById('crosshair-eq');
-        document.querySelectorAll('.eqdot').forEach(function(dot) {{
+        var tooltip = document.getElementById('tooltip-{chart_id}');
+        var crosshair = document.getElementById('crosshair-{chart_id}');
+        document.querySelectorAll('.eqdot-{chart_id}').forEach(function(dot) {{
           dot.addEventListener('mouseenter', function() {{
             var i = parseInt(dot.getAttribute('data-i'), 10);
             var rect = dot.closest('svg').getBoundingClientRect();
             var cx = dot.cx.baseVal.value / {W} * rect.width;
             var cy = dot.cy.baseVal.value / {H} * rect.height;
             tooltip.textContent = dates[i] + '  $' + vals[i].toLocaleString('en-US', {{maximumFractionDigits:0}});
-            tooltip.style.left = (cx + 10) + 'px';
-            tooltip.style.top = (cy - 28) + 'px';
-            tooltip.style.opacity = 1;
-            crosshair.setAttribute('x1', dot.cx.baseVal.value);
-            crosshair.setAttribute('x2', dot.cx.baseVal.value);
-            crosshair.style.opacity = 1;
-          }});
-          dot.addEventListener('mouseleave', function() {{
-            tooltip.style.opacity = 0;
-            crosshair.style.opacity = 0;
-          }});
-        }});
-      }})();
-    </script>
-    """
-
-
-def _svg_unrealized_chart(open_rows: list[dict]) -> str:
-    """Scatter of unrealized ROI vs. entry order for currently-open
-    positions: oldest open entry on the left (max days in trade), most
-    recent on the right. Newer entries haven't had time to move from
-    entry, so the right edge necessarily clusters near 0% -- the rolling-
-    average line makes that narrowing visible instead of just implied.
-    """
-    if len(open_rows) < 2:
-        return '<p class="chart-note">Not enough open positions to chart.</p>'
-
-    rows = sorted(open_rows, key=lambda r: r["entry_date"])
-    n = len(rows)
-    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1040, 260, 56, 16, 16, 28
-    vals = [r["roi"] for r in rows]
-    lo, hi = min(vals + [0]), max(vals + [0])
-    pad = (hi - lo) * 0.08 or 1
-    lo, hi = lo - pad, hi + pad
-    span = hi - lo
-
-    def x(i):
-        return PAD_L + (W - PAD_L - PAD_R) * i / (n - 1)
-
-    def y(v):
-        return PAD_T + (H - PAD_T - PAD_B) * (1 - (v - lo) / span)
-
-    pts = [(x(i), y(r["roi"])) for i, r in enumerate(rows)]
-    zero_y = y(0)
-
-    # Centered rolling average (window scales with n, min 5) to show the
-    # flattening trend without claiming false precision on tiny samples.
-    window = max(5, n // 12)
-    roll = []
-    for i in range(n):
-        lo_i, hi_i = max(0, i - window // 2), min(n, i + window // 2 + 1)
-        roll.append(sum(vals[lo_i:hi_i]) / (hi_i - lo_i))
-    roll_path = "M " + " L ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(roll))
-
-    gridlines = ""
-    for frac in (0, 0.25, 0.5, 0.75, 1):
-        gy = PAD_T + (H - PAD_T - PAD_B) * frac
-        val = hi - span * frac
-        gridlines += (f'<line x1="{PAD_L}" y1="{gy:.1f}" x2="{W-PAD_R}" y2="{gy:.1f}" '
-                      f'stroke="var(--grid)" stroke-width="1"/>'
-                      f'<text x="{PAD_L-8}" y="{gy+3:.1f}" text-anchor="end" font-size="10" '
-                      f'fill="var(--ink-muted)" class="num">{val:+.0f}%</text>')
-
-    dots_visible = "".join(
-        f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" '
-        f'fill="{"var(--good)" if r["roi"] >= 0 else "var(--critical)"}" opacity="0.75"/>'
-        for (px, py), r in zip(pts, rows)
-    )
-    dots_hover = "".join(
-        f'<circle class="urdot" data-i="{i}" cx="{px:.1f}" cy="{py:.1f}" r="7" fill="transparent"/>'
-        for i, (px, py) in enumerate(pts)
-    )
-
-    labels_json = json.dumps([f'{r["symbol"]} · entered {r["entry_date"]} · {r["hold_days"]}d · {r["roi"]:+.1f}%' for r in rows])
-
-    return f"""
-    <div style="position:relative;">
-      <svg viewBox="0 0 {W} {H}" style="width:100%; height:auto; display:block;">
-        {gridlines}
-        <line x1="{PAD_L}" y1="{zero_y:.1f}" x2="{W-PAD_R}" y2="{zero_y:.1f}" stroke="var(--baseline)" stroke-width="1"/>
-        <path d="{roll_path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" opacity="0.85"/>
-        <g>{dots_visible}</g>
-        <g id="urHover">{dots_hover}</g>
-        <line id="crosshair-ur" x1="0" y1="{PAD_T}" x2="0" y2="{H-PAD_B}" stroke="var(--ink-muted)"
-              stroke-width="1" stroke-dasharray="3,3" style="opacity:0;"/>
-      </svg>
-      <div id="tooltip-ur" class="tooltip"></div>
-    </div>
-    <script>
-      (function() {{
-        var labels = {labels_json};
-        var tooltip = document.getElementById('tooltip-ur');
-        var crosshair = document.getElementById('crosshair-ur');
-        document.querySelectorAll('.urdot').forEach(function(dot) {{
-          dot.addEventListener('mouseenter', function() {{
-            var i = parseInt(dot.getAttribute('data-i'), 10);
-            var rect = dot.closest('svg').getBoundingClientRect();
-            var cx = dot.cx.baseVal.value / {W} * rect.width;
-            var cy = dot.cy.baseVal.value / {H} * rect.height;
-            tooltip.textContent = labels[i];
             tooltip.style.left = (cx + 10) + 'px';
             tooltip.style.top = (cy - 28) + 'px';
             tooltip.style.opacity = 1;
@@ -428,7 +341,7 @@ BODY_SCRIPT_TEMPLATE = """
 
 
 def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
-               equity_curve: list[dict], today: str) -> str:
+               equity_curve: list[dict], unrealized_curve: list[dict], today: str) -> str:
     win_rate = stats["win_rate"] or 0
     avg_roi_closed = (stats["avg_roi_closed"] or 0) * 100
     avg_roi_open = (stats["avg_roi_open"] or 0) * 100
@@ -457,16 +370,15 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
 
   <h2>Cumulative realized P&amp;L</h2>
   <div class="panel">
-    {_svg_equity_chart(equity_curve)}
+    {_svg_equity_chart(equity_curve, chart_id="eq", empty_msg="Not enough closed trades yet to chart an equity curve.")}
     <div class="chart-note">Running total of normalized ($1,000/trade) realized P&amp;L across closed trades, by exit date.</div>
   </div>
 
-  <h2>Unrealized P&amp;L (open positions)</h2>
+  <h2>Cumulative unrealized P&amp;L (open positions)</h2>
   <div class="panel">
-    {_svg_unrealized_chart(open_rows)}
-    <div class="chart-note">Each dot is one open position's current ROI, ordered left-to-right by entry date (oldest / most days
-      in trade on the left, most recently entered on the right). The line is a rolling average &mdash; newer entries haven't had
-      time to move from entry, so the right edge naturally flattens toward 0%.</div>
+    {_svg_equity_chart(unrealized_curve, chart_id="ur", empty_msg="Not enough open positions yet to chart.")}
+    <div class="chart-note">Running total of normalized ($1,000/position) unrealized P&amp;L across currently-open positions, by
+      entry date &mdash; the rightmost point is today's total unrealized P&amp;L across every open position.</div>
   </div>
 
   {_table_section("Open positions", open_rows, "open")}
@@ -487,11 +399,12 @@ def main():
     log.to_csv(Path(__file__).with_name("trade_log_12mo.csv"), index=False)
     stats = summarize(log)
     equity_curve = _equity_curve(log)
+    unrealized_curve = _unrealized_cumulative_curve(log)
     open_rows = _rows_for_js(log, "open")
     closed_rows = _rows_for_js(log, "closed")
     today = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-    body = build_body(stats, open_rows, closed_rows, equity_curve, today)
+    body = build_body(stats, open_rows, closed_rows, equity_curve, unrealized_curve, today)
 
     full_html = f"""<!DOCTYPE html>
 <html lang="en">
