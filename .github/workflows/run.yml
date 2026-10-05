@@ -1,6 +1,6 @@
 name: Run method1 RSI Tracker
 
-on:
+"on":
   schedule:
     # Once daily, weekdays only -- the signal is based on daily closing
     # prices (RSI computed from each day's close), so there's no benefit
