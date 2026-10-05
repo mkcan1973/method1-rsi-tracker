@@ -379,6 +379,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
 
 def main():
     log = build_trade_log(months=12)
+    log.to_csv(Path(__file__).with_name("trade_log_12mo.csv"), index=False)
     stats = summarize(log)
     equity_curve = _equity_curve(log)
     open_rows = _rows_for_js(log, "open")
