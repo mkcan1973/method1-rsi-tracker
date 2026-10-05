@@ -1,0 +1,49 @@
+name: Run method1 RSI Tracker
+
+on:
+  schedule:
+    # Once daily, weekdays only -- the signal is based on daily closing
+    # prices (RSI computed from each day's close), so there's no benefit
+    # to running more than once/day; it literally can't change until the
+    # next close exists.
+    # 20:30 UTC = 4:30pm EDT / 3:30pm EST -- after the 4pm ET close, so
+    # Yahoo has posted final closing data. Cron is fixed UTC and doesn't
+    # shift for US daylight saving, so this lands ~30min before close
+    # during EST (Nov-Mar) -- not worth a second seasonal cron for that.
+    - cron: "30 20 * * 1-5"
+  workflow_dispatch: {}  # manual trigger from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scan (refreshes data + today's RSI scan)
+        run: python scan.py
+
+      - name: Prune database to trailing window
+        run: python prune.py
+
+      - name: Rebuild web dashboard
+        run: |
+          python web_summary.py
+          cp web_summary.html index.html
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add method1.sqlite3 scan_results.csv trade_log_12mo.csv web_summary.html index.html sp500_constituents.json
+          git diff --staged --quiet || git commit -m "Run: $(date -u +%Y-%m-%dT%H:%M)Z"
+          git push
