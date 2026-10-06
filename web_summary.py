@@ -253,10 +253,23 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
         }}
 
         function render(startStr, endStr) {{
-          current = ALL.filter(function(c) {{
+          var sliced = ALL.filter(function(c) {{
             return c.date >= startStr && (!endStr || c.date <= endStr);
           }});
-          if (current.length < 2) {{ current = ALL.slice(-2); }}
+          if (sliced.length < 2) {{ sliced = ALL.slice(-2); }}
+
+          // Rebase so every line starts at zero within the selected
+          // window, rather than carrying forward wherever the running
+          // total happened to stand before this window began.
+          var base = sliced[0];
+          current = sliced.map(function(c) {{
+            return {{
+              date: c.date,
+              realized: c.realized - base.realized,
+              unrealized: c.unrealized - base.unrealized,
+              total: c.total - base.total,
+            }};
+          }});
 
           var n = current.length;
           var allVals = [];
