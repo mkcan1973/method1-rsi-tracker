@@ -17,11 +17,12 @@ from stock_universe import get_sp500_tickers
 
 
 # Fixed anchor rather than "N months ago from today": the web dashboard's
-# 2025 / 2026 YTD / Live toggle needs full-year 2025 data available at all
-# times, not just a trailing window that would eventually slide past it.
-# ~3 months of warmup before 2025-01-01 covers even the 50-day MA. Revisit
-# this (and prune.py's matching KEEP_DAYS) when adding a 2027 button.
-DEFAULT_START_DATE = "2024-10-01"
+# 2023 / 2024 / 2025 / 2026 YTD / Live toggle needs full-year data available
+# at all times for each of those years, not just a trailing window that
+# would eventually slide past them. ~3 months of warmup before 2023-01-01
+# covers even the 50-day MA. prune.py's KEEP_DAYS derives from this
+# constant automatically -- revisit this when adding a 2027 button.
+DEFAULT_START_DATE = "2022-10-01"
 
 
 def build_trade_log(start_date: str = DEFAULT_START_DATE) -> pd.DataFrame:
