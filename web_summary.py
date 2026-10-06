@@ -32,6 +32,23 @@ FULL_HTML_PATH = Path(__file__).with_name("web_summary.html")
 _CALENDAR_REF_SYMBOL = "SPY"
 
 
+def _n_active_curve(df: pd.DataFrame, calendar: pd.DatetimeIndex) -> pd.Series:
+    """Count of positions actively held on each calendar date -- BOTH open
+    and already-closed trades, unlike open_mtm_series (which only covers
+    positions still open today). Needed as the capital-base denominator for
+    an honest CAGR: "how much was actually tied up at once," not just
+    today's open count. A trade is active on [entry_date, exit_date) --
+    matching indicators.py's own convention that the exit day itself is no
+    longer held -- or [entry_date, today] if still open.
+    """
+    entry_delta = df["entry_date"].value_counts()
+    exit_delta = df["exit_date"].dropna().value_counts()
+    delta = pd.Series(0.0, index=calendar)
+    delta = delta.add(entry_delta.reindex(calendar, fill_value=0), fill_value=0)
+    delta = delta.add(-exit_delta.reindex(calendar, fill_value=0), fill_value=0)
+    return delta.cumsum()
+
+
 def _mtm_curve(df: pd.DataFrame, open_mtm_series: dict, start_date: str = DEFAULT_START_DATE) -> list[dict]:
     """Realized, unrealized, and total P&L on ONE shared calendar axis
     spanning every trading day since start_date:
@@ -40,6 +57,8 @@ def _mtm_curve(df: pd.DataFrame, open_mtm_series: dict, start_date: str = DEFAUL
       unrealized(d) = sum of every currently-open position's mark-to-market
                       P&L AT d (0 before that position's own entry date)
       total(d)      = realized(d) + unrealized(d)
+      n_active(d)   = how many positions (open + closed) were held on d --
+                      the capital-base denominator the page uses for CAGR
     """
     conn = data_db.connect()
     ref_bars = data_db.load_bars(conn, _CALENDAR_REF_SYMBOL)
@@ -64,9 +83,11 @@ def _mtm_curve(df: pd.DataFrame, open_mtm_series: dict, start_date: str = DEFAUL
         realized = pd.Series(0.0, index=calendar)
 
     total = realized + unrealized
+    n_active = _n_active_curve(df, calendar)
     return [
-        {"date": d.strftime("%Y-%m-%d"), "realized": round(r, 2), "unrealized": round(u, 2), "total": round(t, 2)}
-        for d, r, u, t in zip(calendar, realized, unrealized, total)
+        {"date": d.strftime("%Y-%m-%d"), "realized": round(r, 2), "unrealized": round(u, 2),
+         "total": round(t, 2), "n_active": round(n, 1)}
+        for d, r, u, t, n in zip(calendar, realized, unrealized, total, n_active)
     ]
 
 
@@ -185,6 +206,20 @@ STYLE = """
 HEAD_LINK = '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">'
 
 
+def _year_buttons_html(first_date: str, last_date: str) -> str:
+    """One button per COMPLETE calendar year the data covers (data starts
+    partway through DEFAULT_START_DATE's year, and the current year is
+    handled by the YTD button instead).
+    """
+    current_year = last_date[:4]
+    start_year, end_year = int(first_date[:4]), int(last_date[:4])
+    years_present = [
+        str(y) for y in range(start_year, end_year + 1)
+        if str(y) != current_year and f"{y}-01-01" >= first_date
+    ]
+    return "".join(f'<button class="toggle-btn" data-range="{y}">{y}</button>' for y in years_present)
+
+
 def _svg_mtm_chart(curve: list[dict]) -> str:
     """One chart, three lines, one shared calendar axis: realized (step
     function, flat between exits), unrealized (sum of currently-open
@@ -194,22 +229,14 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
     needs to re-slice the full embedded series and rescale the axes to
     whatever window is selected, which a statically-rendered SVG path
     can't do. Python's job is just to hand the complete daily series over.
+
+    The toggle bar itself lives at the page level (build_body), not here,
+    since it now drives the stat tiles and tables too, not just this
+    chart -- this function only exposes window.mtmRender() for the page's
+    shared toggle handler to call.
     """
     if len(curve) < 2:
         return '<p class="chart-note">Not enough data yet to chart.</p>'
-
-    # Only a button per COMPLETE calendar year the data actually covers
-    # (data starts partway through DEFAULT_START_DATE's year, and the
-    # current year is handled by the YTD button instead).
-    first_date, last_date = curve[0]["date"], curve[-1]["date"]
-    current_year = last_date[:4]
-    years_present = sorted({
-        c["date"][:4] for c in curve
-        if c["date"][:4] != current_year and f'{c["date"][:4]}-01-01' >= first_date
-    })
-    year_buttons = "".join(
-        f'<button class="toggle-btn" data-range="{y}">{y}</button>' for y in years_present
-    )
 
     data_json = json.dumps(curve)
 
@@ -218,12 +245,6 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
       <span class="legend-item"><span class="swatch" style="background:var(--series-total)"></span>Total (realized + unrealized)</span>
       <span class="legend-item"><span class="swatch" style="background:var(--series-realized)"></span>Realized</span>
       <span class="legend-item"><span class="swatch" style="background:var(--series-unrealized)"></span>Unrealized</span>
-    </div>
-    <div class="togglebar">
-      {year_buttons}
-      <button class="toggle-btn" data-range="ytd">{curve[-1]["date"][:4]} YTD</button>
-      <button class="toggle-btn" data-range="live">Live from...</button>
-      <input type="date" id="liveDateInput" min="{curve[0]['date']}" max="{curve[-1]['date']}" hidden>
     </div>
     <div style="position:relative;">
       <svg viewBox="0 0 1040 300" style="width:100%; height:auto; display:block;" id="mtmSvg">
@@ -330,47 +351,24 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
           crosshair.style.opacity = 0;
         }});
 
-        var liveInput = document.getElementById('liveDateInput');
-        function setActive(btn) {{
-          document.querySelectorAll('.toggle-btn').forEach(function(b) {{ b.classList.remove('active'); }});
-          if (btn) btn.classList.add('active');
-        }}
-
-        document.querySelectorAll('.toggle-btn').forEach(function(btn) {{
-          btn.addEventListener('click', function() {{
-            var range = btn.getAttribute('data-range');
-            if (range === 'live') {{
-              liveInput.hidden = false;
-              liveInput.focus();
-              setActive(btn);
-              return;
-            }}
-            liveInput.hidden = true;
-            setActive(btn);
-            if (range === 'ytd') {{
-              render(ALL[ALL.length - 1].date.slice(0, 4) + '-01-01', null);
-            }} else {{
-              render(range + '-01-01', range + '-12-31');
-            }}
-          }});
-        }});
-        liveInput.addEventListener('change', function() {{
-          if (liveInput.value) {{ render(liveInput.value, null); }}
-        }});
-
-        // Default view: current year to date.
-        var ytdBtn = document.querySelector('.toggle-btn[data-range="ytd"]');
-        setActive(ytdBtn);
-        render(ALL[ALL.length - 1].date.slice(0, 4) + '-01-01', null);
+        // The page-level toggle bar (build_body) drives this, not this
+        // chart script itself -- it calls window.mtmRender(start, end)
+        // whenever the selected window changes, so the chart stays in
+        // sync with the stat tiles and tables under one shared control.
+        // window.mtmAll is also exposed so the CAGR tile can reuse the
+        // same n_active/total data without a second copy being embedded.
+        window.mtmRender = render;
+        window.mtmAll = ALL;
       }})();
     </script>
     """
 
 
-def _table_section(title: str, rows: list[dict], status: str) -> str:
+def _table_section(title: str, rows: list[dict], status: str, initial_count: int) -> str:
     table_id = f"tbl-{status}"
     search_id = f"search-{status}"
     count_id = f"count-{status}"
+    header_count_id = f"header-count-{status}"
 
     if status == "open":
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("entry_price", "Entry $"),
@@ -387,7 +385,7 @@ def _table_section(title: str, rows: list[dict], status: str) -> str:
     )
 
     return f"""
-    <h2>{title} <span class="num" style="color:var(--ink-muted); font-size:0.85rem;">({len(rows)})</span></h2>
+    <h2>{title} <span class="num" id="{header_count_id}" style="color:var(--ink-muted); font-size:0.85rem;">({initial_count})</span></h2>
     <div class="panel">
       <div class="tablebar">
         <input type="text" id="{search_id}" placeholder="Filter symbol..." oninput="filterTable('{table_id}','{search_id}','{count_id}')">
@@ -406,10 +404,24 @@ def _table_section(title: str, rows: list[dict], status: str) -> str:
 BODY_SCRIPT_TEMPLATE = """
 <script>
   var DATA = {data_json};
+  var TODAY = "{today}";
+  // The window-filtered (by the shared toggle) subset each table/tile
+  // actually reads from -- separate from DATA itself, which always holds
+  // the complete, unfiltered dataset so any window can be re-selected.
+  var WINDOWED = { open: DATA.open, closed: DATA.closed };
 
   function fmtRoi(v) {
     var cls = v >= 0 ? 'good' : 'critical';
     return '<span class="roi ' + cls + '">' + (v >= 0 ? '+' : '') + v.toFixed(2) + '%</span>';
+  }
+  function fmtMoney(v) {
+    return (v >= 0 ? '+$' : '-$') + Math.abs(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+  }
+  function setTileValue(id, text, cls) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    if (cls) el.className = 'value ' + cls;
   }
 
   function renderTable(tblId, rows, status) {
@@ -439,7 +451,7 @@ BODY_SCRIPT_TEMPLATE = """
 
   var sortState = {};
   function sortRows(status, key) {
-    var rows = DATA[status].slice();
+    var rows = WINDOWED[status].slice();
     var asc = sortState[status + ':' + key] !== true;
     sortState = {};
     sortState[status + ':' + key] = asc;
@@ -451,14 +463,14 @@ BODY_SCRIPT_TEMPLATE = """
       if (av > bv) return asc ? 1 : -1;
       return 0;
     });
-    DATA[status + '_sorted'] = rows;
+    WINDOWED[status] = rows;
     applyFilter(status);
   }
 
   function applyFilter(status) {
     var tblId = 'tbl-' + status, searchId = 'search-' + status, countId = 'count-' + status;
     var q = (document.getElementById(searchId).value || '').trim().toUpperCase();
-    var base = DATA[status + '_sorted'] || DATA[status];
+    var base = WINDOWED[status];
     var rows = q ? base.filter(function(r) { return r.symbol.indexOf(q) !== -1; }) : base;
     renderTable(tblId, rows, status);
     document.getElementById(countId).textContent = rows.length + ' of ' + base.length;
@@ -469,18 +481,111 @@ BODY_SCRIPT_TEMPLATE = """
     applyFilter(status);
   }
 
-  ['open', 'closed'].forEach(function(status) {
-    DATA[status + '_sorted'] = DATA[status];
-    applyFilter(status);
-    document.querySelectorAll('#tbl-' + status + ' thead th').forEach(function(th) {
-      th.addEventListener('click', function() { sortRows(status, th.getAttribute('data-key')); });
+  function applyDateWindow(startStr, endStr) {
+    WINDOWED.open = DATA.open.filter(function(r) {
+      return r.entry_date >= startStr && (!endStr || r.entry_date <= endStr);
+    });
+    WINDOWED.closed = DATA.closed.filter(function(r) {
+      return r.exit_date >= startStr && (!endStr || r.exit_date <= endStr);
+    });
+    sortState = {};
+
+    document.getElementById('header-count-open').textContent = '(' + WINDOWED.open.length + ')';
+    document.getElementById('header-count-closed').textContent = '(' + WINDOWED.closed.length + ')';
+    applyFilter('open');
+    applyFilter('closed');
+
+    var closedRois = WINDOWED.closed.map(function(r) { return r.roi; });
+    var openRois = WINDOWED.open.map(function(r) { return r.roi; });
+    var winRate = closedRois.length ? closedRois.filter(function(r) { return r > 0; }).length / closedRois.length : 0;
+    var avgRoiClosed = closedRois.length ? closedRois.reduce(function(a, b) { return a + b; }, 0) / closedRois.length : 0;
+    var avgRoiOpen = openRois.length ? openRois.reduce(function(a, b) { return a + b; }, 0) / openRois.length : 0;
+    var totalPnl = closedRois.reduce(function(a, b) { return a + b; }, 0) * 10;  // roi is %, normalized to $1000/trade
+
+    setTileValue('tileOpenCount', WINDOWED.open.length);
+    setTileValue('tileClosedCount', WINDOWED.closed.length);
+    setTileValue('tileWinRate', (winRate * 100).toFixed(1) + '%');
+    setTileValue('tileAvgRoiClosed', (avgRoiClosed >= 0 ? '+' : '') + avgRoiClosed.toFixed(2) + '%', avgRoiClosed >= 0 ? 'good' : 'critical');
+    setTileValue('tileAvgRoiOpen', (avgRoiOpen >= 0 ? '+' : '') + avgRoiOpen.toFixed(2) + '%', avgRoiOpen >= 0 ? 'good' : 'critical');
+    setTileValue('tileTotalPnl', fmtMoney(totalPnl), totalPnl >= 0 ? 'good num' : 'critical num');
+    document.getElementById('tileTotalPnlSub').textContent = 'across ' + WINDOWED.closed.length + ' trades, $1,000 risk each';
+
+    if (window.mtmRender) window.mtmRender(startStr, endStr);
+
+    // CAGR, computed the honest way (not by extrapolating trade frequency --
+    // see method1's own earlier false-start on that): compound the Total
+    // line's ACTUAL $ change over the window's REAL elapsed calendar days,
+    // against a stated capital base of $1,000 x the average number of
+    // positions concurrently held during the window.
+    if (window.mtmAll) {
+      var sliced = window.mtmAll.filter(function(c) { return c.date >= startStr && (!endStr || c.date <= endStr); });
+      var cagrEl = document.getElementById('tileCagr'), subEl = document.getElementById('tileCagrSub');
+      if (sliced.length >= 2 && cagrEl) {
+        var base = sliced[0];
+        var finalTotal = sliced[sliced.length - 1].total - base.total;
+        var avgNActive = sliced.reduce(function(s, c) { return s + c.n_active; }, 0) / sliced.length;
+        var capitalBase = avgNActive * 1000;
+        var daysSpan = (new Date(sliced[sliced.length - 1].date) - new Date(sliced[0].date)) / 86400000;
+        var cagr = null;
+        if (capitalBase > 0 && daysSpan > 0) {
+          var totalReturnFrac = finalTotal / capitalBase;
+          if (totalReturnFrac > -1) { cagr = Math.pow(1 + totalReturnFrac, 365 / daysSpan) - 1; }
+        }
+        if (cagr !== null) {
+          setTileValue('tileCagr', (cagr >= 0 ? '+' : '') + (cagr * 100).toFixed(1) + '%', cagr >= 0 ? 'good' : 'critical');
+        } else {
+          setTileValue('tileCagr', 'n/a');
+        }
+        if (subEl) {
+          subEl.textContent = 'capital base: $' + Math.round(capitalBase).toLocaleString() +
+            ' (avg ' + avgNActive.toFixed(1) + ' positions × $1,000), ' + Math.round(daysSpan) + ' days';
+        }
+      }
+    }
+  }
+
+  var liveInput = document.getElementById('liveDateInput');
+  function setActiveToggle(btn) {
+    document.querySelectorAll('.toggle-btn').forEach(function(b) { b.classList.remove('active'); });
+    if (btn) btn.classList.add('active');
+  }
+  document.querySelectorAll('.toggle-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var range = btn.getAttribute('data-range');
+      if (range === 'live') {
+        liveInput.hidden = false;
+        liveInput.focus();
+        setActiveToggle(btn);
+        return;
+      }
+      liveInput.hidden = true;
+      setActiveToggle(btn);
+      if (range === 'ytd') {
+        applyDateWindow(TODAY.slice(0, 4) + '-01-01', null);
+      } else {
+        applyDateWindow(range + '-01-01', range + '-12-31');
+      }
     });
   });
+  liveInput.addEventListener('change', function() {
+    if (liveInput.value) { applyDateWindow(liveInput.value, null); }
+  });
+
+  document.querySelectorAll('table thead th').forEach(function(th) {
+    th.addEventListener('click', function() {
+      sortRows(th.getAttribute('data-tbl').replace('tbl-', ''), th.getAttribute('data-key'));
+    });
+  });
+
+  // Default view: current year to date.
+  setActiveToggle(document.querySelector('.toggle-btn[data-range="ytd"]'));
+  applyDateWindow(TODAY.slice(0, 4) + '-01-01', null);
 </script>
 """
 
 
 def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
+               open_count_ytd: int, closed_count_ytd: int,
                mtm_curve: list[dict], today: str) -> str:
     win_rate = stats["win_rate"] or 0
     avg_roi_closed = (stats["avg_roi_closed"] or 0) * 100
@@ -488,24 +593,37 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     total_pnl = stats["total_normalized_pnl"]
 
     data_json = json.dumps({"open": open_rows, "closed": closed_rows})
+    year_buttons = _year_buttons_html(mtm_curve[0]["date"], mtm_curve[-1]["date"]) if len(mtm_curve) >= 2 else ""
+    live_min = mtm_curve[0]["date"] if mtm_curve else today
+    live_max = mtm_curve[-1]["date"] if mtm_curve else today
 
     return f"""
 <div class="wrap">
   <h1>RSI Trade Log</h1>
-  <div class="subtitle">RSI(14) mean reversion &middot; S&amp;P 500 + core ETFs/index &middot; trailing 12 months</div>
+  <div class="subtitle">RSI(14) mean reversion &middot; S&amp;P 500 + core ETFs/index</div>
   <div class="asof">As of {today} &middot; signal only, no orders placed &middot; normalized to $1,000 risked per trade</div>
 
+  <div class="togglebar">
+    {year_buttons}
+    <button class="toggle-btn" data-range="ytd">{today[:4]} YTD</button>
+    <button class="toggle-btn" data-range="live">Live from...</button>
+    <input type="date" id="liveDateInput" min="{live_min}" max="{live_max}" hidden>
+  </div>
+
   <div class="tiles">
-    <div class="tile"><div class="label">Open positions</div><div class="value">{len(open_rows)}</div></div>
-    <div class="tile"><div class="label">Closed trades (12mo)</div><div class="value">{len(closed_rows)}</div></div>
-    <div class="tile"><div class="label">Win rate (closed)</div><div class="value">{win_rate*100:.1f}%</div></div>
+    <div class="tile"><div class="label">Open positions</div><div class="value" id="tileOpenCount">{open_count_ytd}</div></div>
+    <div class="tile"><div class="label">Closed trades</div><div class="value" id="tileClosedCount">{closed_count_ytd}</div></div>
+    <div class="tile"><div class="label">Win rate (closed)</div><div class="value" id="tileWinRate">{win_rate*100:.1f}%</div></div>
     <div class="tile"><div class="label">Avg ROI / closed trade</div>
-      <div class="value {'good' if avg_roi_closed>=0 else 'critical'}">{avg_roi_closed:+.2f}%</div></div>
+      <div class="value {'good' if avg_roi_closed>=0 else 'critical'}" id="tileAvgRoiClosed">{avg_roi_closed:+.2f}%</div></div>
     <div class="tile"><div class="label">Avg unrealized ROI (open)</div>
-      <div class="value {'good' if avg_roi_open>=0 else 'critical'}">{avg_roi_open:+.2f}%</div></div>
+      <div class="value {'good' if avg_roi_open>=0 else 'critical'}" id="tileAvgRoiOpen">{avg_roi_open:+.2f}%</div></div>
     <div class="tile"><div class="label">Total realized P&amp;L</div>
-      <div class="value {'good' if total_pnl>=0 else 'critical'} num">${total_pnl:,.0f}</div>
-      <div class="sub">across {len(closed_rows)} trades, $1,000 risk each</div></div>
+      <div class="value {'good' if total_pnl>=0 else 'critical'} num" id="tileTotalPnl">${total_pnl:,.0f}</div>
+      <div class="sub" id="tileTotalPnlSub">across {closed_count_ytd} trades, $1,000 risk each</div></div>
+    <div class="tile"><div class="label">Annualized (CAGR)</div>
+      <div class="value" id="tileCagr">--</div>
+      <div class="sub" id="tileCagrSub"></div></div>
   </div>
 
   <h2>Realized, unrealized &amp; total P&amp;L</h2>
@@ -516,8 +634,8 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
       (0 before a position's own entry date); total is their sum &mdash; today's rightmost point is your actual current P&amp;L.</div>
   </div>
 
-  {_table_section("Open positions", open_rows, "open")}
-  {_table_section("Closed positions (last 12 months)", closed_rows, "closed")}
+  {_table_section("Open positions", open_rows, "open", open_count_ytd)}
+  {_table_section("Closed positions", closed_rows, "closed", closed_count_ytd)}
 
   <footer>
     Strategy: buy when RSI(14) &le; 20 (oversold), hold until RSI &ge; 65, flat otherwise &mdash;
@@ -526,27 +644,35 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     and threshold_train_test.py). This page is a reporting view of that signal, not investment advice.
   </footer>
 </div>
-{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json)}
+{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{today}", today)}
 """
 
 
 def main():
-    # The chart (toggle: 2025 / YTD / Live) needs the full extended range;
-    # the stat tiles and tables stay scoped to trailing 12 months, matching
-    # their own "(12mo)" labeling -- open positions are kept regardless of
-    # how long ago they entered, same as the original build_trade_log().
+    # The tiles, chart, and tables are now all driven by the SAME toggle
+    # (2025 / YTD / Live) -- so all three need the full extended range
+    # embedded in JS, not just a trailing-12-month slice. A separate
+    # trade_log_12mo.csv snapshot is still written for anyone consuming
+    # the data outside the page.
     log, open_mtm_series = build_trade_log_with_mtm()
     twelve_months_ago = pd.Timestamp.today().normalize() - pd.DateOffset(months=12)
     log_12mo = log[(log["status"] == "open") | (log["exit_date"] >= twelve_months_ago)]
     log_12mo.to_csv(Path(__file__).with_name("trade_log_12mo.csv"), index=False)
 
-    stats = summarize(log_12mo)
-    mtm_curve = _mtm_curve(log, open_mtm_series)
-    open_rows = _rows_for_js(log_12mo, "open")
-    closed_rows = _rows_for_js(log_12mo, "closed")
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    today_ts = pd.Timestamp.today().normalize()
+    today = today_ts.strftime("%Y-%m-%d")
+    ytd_start = pd.Timestamp(year=today_ts.year, month=1, day=1)
+    log_ytd = log[(log["status"] == "open") & (log["entry_date"] >= ytd_start)
+                  | (log["status"] == "closed") & (log["exit_date"] >= ytd_start)]
 
-    body = build_body(stats, open_rows, closed_rows, mtm_curve, today)
+    stats = summarize(log_ytd)  # initial server-rendered paint matches JS's own YTD default
+    mtm_curve = _mtm_curve(log, open_mtm_series)
+    open_rows = _rows_for_js(log, "open")
+    closed_rows = _rows_for_js(log, "closed")
+    open_count_ytd = int((log_ytd["status"] == "open").sum())
+    closed_count_ytd = int((log_ytd["status"] == "closed").sum())
+
+    body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, today)
 
     full_html = f"""<!DOCTYPE html>
 <html lang="en">
