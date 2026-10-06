@@ -16,19 +16,42 @@ from universe import tradeable_tickers
 from stock_universe import get_sp500_tickers
 
 
-def build_trade_log(months: int = 12) -> pd.DataFrame:
+# Fixed anchor rather than "N months ago from today": the web dashboard's
+# 2025 / 2026 YTD / Live toggle needs full-year 2025 data available at all
+# times, not just a trailing window that would eventually slide past it.
+# ~3 months of warmup before 2025-01-01 covers even the 50-day MA. Revisit
+# this (and prune.py's matching KEEP_DAYS) when adding a 2027 button.
+DEFAULT_START_DATE = "2024-10-01"
+
+
+def build_trade_log(start_date: str = DEFAULT_START_DATE) -> pd.DataFrame:
+    return build_trade_log_with_mtm(start_date=start_date)[0]
+
+
+def build_trade_log_with_mtm(start_date: str = DEFAULT_START_DATE) -> tuple[pd.DataFrame, dict]:
+    """Same trade reconstruction as build_trade_log(), plus (in the same
+    pass over the universe, to avoid doubling the ~2-3min runtime) each
+    currently-open position's daily mark-to-market P&L series from its own
+    entry date through today -- needed to plot unrealized P&L on a real
+    calendar axis rather than just today's single snapshot value.
+
+    Returns (trades_df, open_mtm_series) where open_mtm_series maps
+    symbol -> pd.Series of (price/entry_price - 1)*1000, indexed by date,
+    for every currently-open position.
+    """
     conn = data_db.connect()
     symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers()))
-    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(months=months)
+    cutoff = pd.Timestamp(start_date)
 
     trades = []
+    open_mtm_series = {}
     for symbol in symbols:
         bars = data_db.load_bars(conn, symbol)
         # 120 trading days comfortably covers feature warmup (the longest
         # rolling window is the 50-day MA) -- this isn't backtest.py's
         # walk-forward harness, which needs much deeper history for
         # multiple yearly folds; this just needs enough for RSI/MACD to be
-        # valid before the 12-month trade-log window begins.
+        # valid before the trade-log window begins.
         if bars is None or len(bars) < 120:
             continue
         feats = features.build_features(bars)
@@ -62,12 +85,13 @@ def build_trade_log(months: int = 12) -> pd.DataFrame:
                 roi=current_price / entry_price - 1, status="open",
                 hold_days=(position.index[-1] - entry_date).days,
             ))
+            open_mtm_series[symbol] = (close.loc[entry_date:] / entry_price - 1) * 1000
 
     conn.close()
     df = pd.DataFrame(trades)
     if not df.empty:
         df = df.sort_values(["status", "entry_date"], ascending=[True, False])
-    return df
+    return df, open_mtm_series
 
 
 def summarize(df: pd.DataFrame) -> dict:
@@ -85,7 +109,7 @@ def summarize(df: pd.DataFrame) -> dict:
 
 
 if __name__ == "__main__":
-    log = build_trade_log(months=12)
+    log = build_trade_log()
     log.to_csv("trade_log_12mo.csv", index=False)
-    print(f"{len(log)} trades in the last 12 months")
+    print(f"{len(log)} trades since {DEFAULT_START_DATE}")
     print(summarize(log))
