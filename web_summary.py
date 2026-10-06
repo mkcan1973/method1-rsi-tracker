@@ -41,7 +41,14 @@ def _n_active_curve(df: pd.DataFrame, calendar: pd.DatetimeIndex) -> pd.Series:
     matching indicators.py's own convention that the exit day itself is no
     longer held -- or [entry_date, today] if still open.
     """
-    entry_delta = df["entry_date"].value_counts()
+    # Clamp entry_date to the calendar's own start date. trade_log.py keeps
+    # a closed trade if its EXIT is >= start_date, even when its entry was
+    # earlier -- so a trade that began before the window but exited inside
+    # it would otherwise contribute a -1 (its exit) with no matching +1
+    # (its entry falls before `calendar` and reindex() silently drops it),
+    # permanently corrupting the cumulative count negative from then on.
+    entry_dates = df["entry_date"].clip(lower=calendar[0])
+    entry_delta = entry_dates.value_counts()
     exit_delta = df["exit_date"].dropna().value_counts()
     delta = pd.Series(0.0, index=calendar)
     delta = delta.add(entry_delta.reindex(calendar, fill_value=0), fill_value=0)
