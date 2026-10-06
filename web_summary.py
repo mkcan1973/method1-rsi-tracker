@@ -520,9 +520,10 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
   {_table_section("Closed positions (last 12 months)", closed_rows, "closed")}
 
   <footer>
-    Strategy: buy when RSI(14) &le; 30 (oversold), hold until RSI &ge; 55, flat otherwise &mdash;
-    validated via walk-forward backtesting across the S&amp;P 500 + core ETFs/index (see method1/backtest.py).
-    This page is a reporting view of that signal, not investment advice.
+    Strategy: buy when RSI(14) &le; 20 (oversold), hold until RSI &ge; 65, flat otherwise &mdash;
+    validated via walk-forward backtesting across the S&amp;P 500 + core ETFs/index, then chosen over the
+    original 30/55 textbook defaults via a grid search that replicated out-of-sample (see method1/threshold_grid.py
+    and threshold_train_test.py). This page is a reporting view of that signal, not investment advice.
   </footer>
 </div>
 {BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json)}

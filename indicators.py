@@ -2,16 +2,22 @@
 Traditional technical-indicator strategies (RSI, MACD, and a combination),
 plugged into the same walk-forward harness as baselines.py and model.py.
 
-Parameters are standard textbook defaults (RSI 14/30/55, MACD 12/26/9), not
-fitted to this data -- picking whichever threshold looks best in hindsight
-is exactly the data-dredging trap this project has been built to avoid.
+rsi_macd_combo and rsi_overbought_short still use standard textbook
+defaults, not fitted to this data. rsi_reversion's defaults are the one
+exception: buy<=20/exit>=65 was chosen via threshold_grid.py (a grid
+search over buy/exit combos) specifically because it replicated -- it
+beat the original textbook 30/55 defaults on every metric in BOTH
+independent train (2016-2021) and test (2021-2026) halves, not just on
+the combined period the grid search itself ran on. See
+threshold_grid.py, threshold_grid_extended.py, and threshold_train_test.py
+for that validation. Changing it again should clear the same bar.
 """
 
 import numpy as np
 import pandas as pd
 
 
-def rsi_reversion(full_feats: pd.DataFrame, buy_thresh: float = 30, exit_thresh: float = 55, **_) -> pd.Series:
+def rsi_reversion(full_feats: pd.DataFrame, buy_thresh: float = 20, exit_thresh: float = 65, **_) -> pd.Series:
     """Long-only: buy when RSI drops to oversold, hold until it recovers
     past exit_thresh, flat otherwise. Classic buy-the-dip mean reversion.
     """

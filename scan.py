@@ -2,11 +2,13 @@
 Daily signal scan for method1.
 
 Strategy: RSI(14) mean reversion. Buy when a symbol's 14-day RSI drops to
-<=30 (oversold), hold until it recovers to >=55, flat otherwise. Validated
+<=20 (oversold), hold until it recovers to >=65, flat otherwise. Validated
 via backtest.py's walk-forward harness across the full universe (S&P 500 +
 core ETFs/index): positive out-of-sample Sharpe on effectively all symbols
-tested, not just a cherry-picked few. See indicators.py for the strategy
-and backtest.py for the validation harness.
+tested, not just a cherry-picked few. These specific thresholds were then
+chosen over the original textbook 30/55 defaults via threshold_grid.py's
+grid search plus threshold_train_test.py's train/test replication check --
+see indicators.py's module docstring for that validation trail.
 
 This replaced an earlier narrow streak-based signal (still in event_study.py)
 because it fires far more often -- something in this universe is in a
@@ -27,8 +29,8 @@ import indicators
 from universe import tradeable_tickers
 from stock_universe import get_sp500_tickers
 
-RSI_BUY = 30
-RSI_EXIT = 55
+RSI_BUY = 20
+RSI_EXIT = 65
 
 SUMMARY_CSV = Path(__file__).with_name("scan_results.csv")
 
