@@ -44,6 +44,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add method1.sqlite3 scan_results.csv trade_log_12mo.csv web_summary.html index.html sp500_constituents.json
+          git add method1.sqlite3 scan_results.csv trade_log_12mo.csv web_summary.html index.html sp500_constituents.json trailing_eps_cache.json
           git diff --staged --quiet || git commit -m "Run: $(date -u +%Y-%m-%dT%H:%M)Z"
           git push

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 import data_db
+from fundamentals import get_trailing_eps
 from trade_log import DEFAULT_START_DATE, build_trade_log_with_mtm, summarize
 
 FULL_HTML_PATH = Path(__file__).with_name("web_summary.html")
@@ -98,10 +99,12 @@ def _mtm_curve(df: pd.DataFrame, open_mtm_series: dict, start_date: str = DEFAUL
     ]
 
 
-def _rows_for_js(df: pd.DataFrame, status: str) -> list[dict]:
+def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dict]:
     sub = df[df["status"] == status].copy()
     out = []
     for r in sub.itertuples():
+        eps = eps_by_symbol.get(r.symbol)
+        pe_at_entry = round(r.entry_price / eps, 1) if eps and eps > 0 else None
         out.append({
             "symbol": r.symbol,
             "entry_date": r.entry_date.strftime("%Y-%m-%d"),
@@ -110,6 +113,7 @@ def _rows_for_js(df: pd.DataFrame, status: str) -> list[dict]:
             "exit_price": round(r.exit_price, 2),
             "roi": round(r.roi * 100, 2),
             "hold_days": int(r.hold_days),
+            "pe_at_entry": pe_at_entry,
         })
     return out
 
@@ -185,9 +189,12 @@ STYLE = """
                     color: var(--ink-1); padding: 6px 10px; font-size: 0.82rem; font-family: inherit; }
 
   .tablebar { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
-  .tablebar input { background: var(--bg-page); border: 1px solid var(--border); border-radius: 7px;
+  .tablebar input[type="text"] { background: var(--bg-page); border: 1px solid var(--border); border-radius: 7px;
                      color: var(--ink-1); padding: 7px 10px; font-size: 0.85rem; width: 160px; }
   .tablebar .count { color: var(--ink-muted); font-size: 0.8rem; margin-left: auto; }
+  .pe-filter-label { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--ink-muted); }
+  .pe-filter-label input[type="number"] { background: var(--bg-page); border: 1px solid var(--border);
+                     border-radius: 7px; color: var(--ink-1); padding: 7px 8px; font-size: 0.85rem; width: 64px; }
 
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   thead th { text-align: left; font-size: 0.72rem; letter-spacing: 0.03em; text-transform: uppercase;
@@ -379,14 +386,15 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
 
     if status == "open":
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("entry_price", "Entry $"),
-                ("exit_price", "Now $"), ("roi", "Unrlzd ROI"), ("hold_days", "Days held")]
+                ("exit_price", "Now $"), ("roi", "Unrlzd ROI"), ("hold_days", "Days held"),
+                ("pe_at_entry", "P/E @ entry")]
     else:
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("exit_date", "Exit"),
                 ("entry_price", "Entry $"), ("exit_price", "Exit $"), ("roi", "ROI"),
-                ("hold_days", "Hold days")]
+                ("hold_days", "Hold days"), ("pe_at_entry", "P/E @ entry")]
 
     header_cells = "".join(
-        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days") else ""}" '
+        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days","pe_at_entry") else ""}" '
         f'data-key="{k}" data-tbl="{table_id}">{label}</th>'
         for k, label in cols
     )
@@ -396,6 +404,11 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
     <div class="panel">
       <div class="tablebar">
         <input type="text" id="{search_id}" placeholder="Filter symbol..." oninput="filterTable('{table_id}','{search_id}','{count_id}')">
+        <label class="pe-filter-label">P/E @ entry
+          <input type="number" id="pe-min-{status}" placeholder="min" oninput="filterTable('{table_id}','{search_id}','{count_id}')">
+          <span>&ndash;</span>
+          <input type="number" id="pe-max-{status}" placeholder="max" oninput="filterTable('{table_id}','{search_id}','{count_id}')">
+        </label>
         <span class="count" id="{count_id}"></span>
       </div>
       <div class="tablewrap">
@@ -431,6 +444,10 @@ BODY_SCRIPT_TEMPLATE = """
     if (cls) el.className = 'value ' + cls;
   }
 
+  function fmtPe(v) {
+    return (v === null || v === undefined) ? '&mdash;' : v.toFixed(1);
+  }
+
   function renderTable(tblId, rows, status) {
     var tbody = document.querySelector('#' + tblId + ' tbody');
     tbody.innerHTML = rows.map(function(r) {
@@ -442,6 +459,7 @@ BODY_SCRIPT_TEMPLATE = """
           '<td class="num">' + r.exit_price.toFixed(2) + '</td>' +
           '<td class="num">' + fmtRoi(r.roi) + '</td>' +
           '<td class="num">' + r.hold_days + '</td>' +
+          '<td class="num">' + fmtPe(r.pe_at_entry) + '</td>' +
           '</tr>';
       }
       return '<tr>' +
@@ -452,6 +470,7 @@ BODY_SCRIPT_TEMPLATE = """
         '<td class="num">' + r.exit_price.toFixed(2) + '</td>' +
         '<td class="num">' + fmtRoi(r.roi) + '</td>' +
         '<td class="num">' + r.hold_days + '</td>' +
+        '<td class="num">' + fmtPe(r.pe_at_entry) + '</td>' +
         '</tr>';
     }).join('');
   }
@@ -477,8 +496,16 @@ BODY_SCRIPT_TEMPLATE = """
   function applyFilter(status) {
     var tblId = 'tbl-' + status, searchId = 'search-' + status, countId = 'count-' + status;
     var q = (document.getElementById(searchId).value || '').trim().toUpperCase();
+    var peMinEl = document.getElementById('pe-min-' + status), peMaxEl = document.getElementById('pe-max-' + status);
+    var peMin = peMinEl && peMinEl.value !== '' ? parseFloat(peMinEl.value) : null;
+    var peMax = peMaxEl && peMaxEl.value !== '' ? parseFloat(peMaxEl.value) : null;
     var base = WINDOWED[status];
-    var rows = q ? base.filter(function(r) { return r.symbol.indexOf(q) !== -1; }) : base;
+    var rows = base.filter(function(r) {
+      if (q && r.symbol.indexOf(q) === -1) return false;
+      if (peMin !== null && (r.pe_at_entry === null || r.pe_at_entry < peMin)) return false;
+      if (peMax !== null && (r.pe_at_entry === null || r.pe_at_entry > peMax)) return false;
+      return true;
+    });
     renderTable(tblId, rows, status);
     document.getElementById(countId).textContent = rows.length + ' of ' + base.length;
   }
@@ -649,6 +676,12 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     validated via walk-forward backtesting across the S&amp;P 500 + core ETFs/index, then chosen over the
     original 30/55 textbook defaults via a grid search that replicated out-of-sample (see method1/threshold_grid.py
     and threshold_train_test.py). This page is a reporting view of that signal, not investment advice.
+    <br><br>
+    P/E @ entry is an approximation (entry price &divide; CURRENT trailing EPS, not the EPS that was actually
+    current on the entry date) -- there's no free historical EPS series to compute it exactly. It's reasonably
+    accurate for trades entered in the last ~2 quarters and increasingly approximate for older ones, since EPS
+    changes every earnings report. Trades in unprofitable companies (negative/missing EPS) show as &mdash; and
+    are excluded by the P/E filter, not treated as having a P/E of zero.
   </footer>
 </div>
 {BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{today}", today)}
@@ -674,8 +707,9 @@ def main():
 
     stats = summarize(log_ytd)  # initial server-rendered paint matches JS's own YTD default
     mtm_curve = _mtm_curve(log, open_mtm_series)
-    open_rows = _rows_for_js(log, "open")
-    closed_rows = _rows_for_js(log, "closed")
+    eps_by_symbol = get_trailing_eps(sorted(log["symbol"].unique()))
+    open_rows = _rows_for_js(log, "open", eps_by_symbol)
+    closed_rows = _rows_for_js(log, "closed", eps_by_symbol)
     open_count_ytd = int((log_ytd["status"] == "open").sum())
     closed_count_ytd = int((log_ytd["status"] == "closed").sum())
 
