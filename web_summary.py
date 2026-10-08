@@ -404,11 +404,6 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
     <div class="panel">
       <div class="tablebar">
         <input type="text" id="{search_id}" placeholder="Filter symbol..." oninput="filterTable('{table_id}','{search_id}','{count_id}')">
-        <label class="pe-filter-label">P/E @ entry
-          <input type="number" id="pe-min-{status}" placeholder="min" oninput="filterTable('{table_id}','{search_id}','{count_id}')">
-          <span>&ndash;</span>
-          <input type="number" id="pe-max-{status}" placeholder="max" oninput="filterTable('{table_id}','{search_id}','{count_id}')">
-        </label>
         <span class="count" id="{count_id}"></span>
       </div>
       <div class="tablewrap">
@@ -496,16 +491,8 @@ BODY_SCRIPT_TEMPLATE = """
   function applyFilter(status) {
     var tblId = 'tbl-' + status, searchId = 'search-' + status, countId = 'count-' + status;
     var q = (document.getElementById(searchId).value || '').trim().toUpperCase();
-    var peMinEl = document.getElementById('pe-min-' + status), peMaxEl = document.getElementById('pe-max-' + status);
-    var peMin = peMinEl && peMinEl.value !== '' ? parseFloat(peMinEl.value) : null;
-    var peMax = peMaxEl && peMaxEl.value !== '' ? parseFloat(peMaxEl.value) : null;
     var base = WINDOWED[status];
-    var rows = base.filter(function(r) {
-      if (q && r.symbol.indexOf(q) === -1) return false;
-      if (peMin !== null && (r.pe_at_entry === null || r.pe_at_entry < peMin)) return false;
-      if (peMax !== null && (r.pe_at_entry === null || r.pe_at_entry > peMax)) return false;
-      return true;
-    });
+    var rows = q ? base.filter(function(r) { return r.symbol.indexOf(q) !== -1; }) : base;
     renderTable(tblId, rows, status);
     document.getElementById(countId).textContent = rows.length + ' of ' + base.length;
   }
@@ -515,12 +502,29 @@ BODY_SCRIPT_TEMPLATE = """
     applyFilter(status);
   }
 
+  // Tracks the currently-selected date window so the global P/E filter
+  // (which lives in the toggle bar, not per-table) can re-apply it without
+  // needing its own copy of which toggle button is active.
+  var currentWindowStart = null, currentWindowEnd = null;
+
   function applyDateWindow(startStr, endStr) {
+    currentWindowStart = startStr;
+    currentWindowEnd = endStr;
+
+    var peMinEl = document.getElementById('pe-min-global'), peMaxEl = document.getElementById('pe-max-global');
+    var peMin = peMinEl && peMinEl.value !== '' ? parseFloat(peMinEl.value) : null;
+    var peMax = peMaxEl && peMaxEl.value !== '' ? parseFloat(peMaxEl.value) : null;
+    function peOk(r) {
+      if (peMin !== null && (r.pe_at_entry === null || r.pe_at_entry < peMin)) return false;
+      if (peMax !== null && (r.pe_at_entry === null || r.pe_at_entry > peMax)) return false;
+      return true;
+    }
+
     WINDOWED.open = DATA.open.filter(function(r) {
-      return r.entry_date >= startStr && (!endStr || r.entry_date <= endStr);
+      return r.entry_date >= startStr && (!endStr || r.entry_date <= endStr) && peOk(r);
     });
     WINDOWED.closed = DATA.closed.filter(function(r) {
-      return r.exit_date >= startStr && (!endStr || r.exit_date <= endStr);
+      return r.exit_date >= startStr && (!endStr || r.exit_date <= endStr) && peOk(r);
     });
     sortState = {};
 
@@ -605,6 +609,14 @@ BODY_SCRIPT_TEMPLATE = """
     if (liveInput.value) { applyDateWindow(liveInput.value, null); }
   });
 
+  // The global P/E filter re-applies the CURRENT date window on every
+  // edit, rather than needing its own copy of which toggle is active.
+  ['pe-min-global', 'pe-max-global'].forEach(function(id) {
+    document.getElementById(id).addEventListener('input', function() {
+      if (currentWindowStart !== null) { applyDateWindow(currentWindowStart, currentWindowEnd); }
+    });
+  });
+
   document.querySelectorAll('table thead th').forEach(function(th) {
     th.addEventListener('click', function() {
       sortRows(th.getAttribute('data-tbl').replace('tbl-', ''), th.getAttribute('data-key'));
@@ -642,7 +654,14 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     <button class="toggle-btn" data-range="ytd">{today[:4]} YTD</button>
     <button class="toggle-btn" data-range="live">Live from...</button>
     <input type="date" id="liveDateInput" min="{live_min}" max="{live_max}" hidden>
+    <label class="pe-filter-label">P/E @ entry
+      <input type="number" id="pe-min-global" placeholder="min">
+      <span>&ndash;</span>
+      <input type="number" id="pe-max-global" placeholder="max">
+    </label>
   </div>
+  <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E filter applies to the stat tiles and tables below
+    (not the chart, which is pre-aggregated by date and can't be re-sliced per-trade without a bigger rework).</div>
 
   <div class="tiles">
     <div class="tile"><div class="label">Open positions</div><div class="value" id="tileOpenCount">{open_count_ytd}</div></div>
