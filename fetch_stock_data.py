@@ -64,7 +64,12 @@ def _download_batch(tickers: list[str], start: str | None) -> dict:
     if data.empty:
         return {}
     if len(tickers) == 1:
-        # Single-ticker batches come back without the ticker level.
+        # Single-ticker batches are usually flat-columned, but not always
+        # (observed: an incremental start= fetch kept the ticker level
+        # while a full-history period="max" fetch didn't) -- handle both
+        # rather than assume one, which crashed on a KeyError.
+        if isinstance(data.columns, pd.MultiIndex):
+            return {tickers[0]: data[tickers[0]]} if tickers[0] in data.columns.get_level_values(0) else {}
         return {tickers[0]: data}
     return {t: data[t] for t in tickers if t in data.columns.get_level_values(0)}
 
