@@ -2,9 +2,18 @@
 Reconstructs the RSI-reversion trade history (entries/exits, open vs
 closed, per-trade ROI) over a trailing window, for the web summary.
 
-Uses the exact same lagged position logic validated in backtest.py and
-used live in scan.py -- this is a reporting view of that same signal, not
-a separate calculation that could drift out of sync with it.
+Uses the exact same signal logic validated in backtest.py and used live
+in scan.py -- this is a reporting view of that same signal, not a
+separate calculation that could drift out of sync with it.
+
+Entry/exit price convention: the day a signal fires (RSI crosses the
+threshold at that day's close) is a detection, not a fill -- you can't
+act on a close until the next session opens. Both entry and exit price
+are therefore the NEXT trading day's open after the signal-crossing
+close, applied symmetrically (an earlier version used the signal day's
+own close as a same-day exit fill, which was inconsistent: realistic
+about entry timing but not about exit timing, since both signals are
+only knowable after that day's close).
 """
 
 import pandas as pd
@@ -56,37 +65,55 @@ def build_trade_log_with_mtm(start_date: str = DEFAULT_START_DATE) -> tuple[pd.D
         if bars is None or len(bars) < 120:
             continue
         feats = features.build_features(bars)
-        position = indicators.rsi_reversion(feats).shift(1).fillna(0)
-        close = bars["close"]
+        # Unshifted: position flips the day its *close* crosses the
+        # threshold -- that close is the signal, not a tradeable price.
+        # indicators.rsi_reversion() itself has no lookahead (RSI at day t
+        # uses only bars <= t), so this is safe to read directly.
+        position = indicators.rsi_reversion(feats).fillna(0)
+        close, open_ = bars["close"], bars["open"]
 
-        entry_date = None
+        entry_signal_date = None
         for i in range(1, len(position)):
             prev, curr = position.iloc[i - 1], position.iloc[i]
             date = position.index[i]
             if prev == 0 and curr == 1:
-                entry_date = date
-            elif prev == 1 and curr == 0 and entry_date is not None:
-                if date >= cutoff:
-                    entry_price, exit_price = close.loc[entry_date], close.loc[date]
+                entry_signal_date = date
+            elif prev == 1 and curr == 0 and entry_signal_date is not None:
+                # Earliest a human could act on each signal is the next
+                # trading day's open -- the close that triggered it is
+                # already known history by the time the market reopens.
+                entry_idx = position.index.get_loc(entry_signal_date)
+                exit_idx = position.index.get_loc(date)
+                if entry_idx + 1 >= len(position) or exit_idx + 1 >= len(position):
+                    entry_signal_date = None
+                    continue
+                entry_fill_date = position.index[entry_idx + 1]
+                exit_fill_date = position.index[exit_idx + 1]
+                if exit_fill_date >= cutoff:
+                    entry_price, exit_price = open_.loc[entry_fill_date], open_.loc[exit_fill_date]
                     trades.append(dict(
-                        symbol=symbol, entry_date=entry_date, exit_date=date,
+                        symbol=symbol, entry_date=entry_fill_date, exit_date=exit_fill_date,
                         entry_price=entry_price, exit_price=exit_price,
                         roi=exit_price / entry_price - 1, status="closed",
-                        hold_days=(date - entry_date).days,
+                        hold_days=(exit_fill_date - entry_fill_date).days,
                     ))
-                entry_date = None
+                entry_signal_date = None
 
         # A still-open trade at the end of history is always relevant,
-        # regardless of when it entered.
-        if entry_date is not None and position.iloc[-1] == 1:
-            entry_price, current_price = close.loc[entry_date], close.iloc[-1]
-            trades.append(dict(
-                symbol=symbol, entry_date=entry_date, exit_date=None,
-                entry_price=entry_price, exit_price=current_price,
-                roi=current_price / entry_price - 1, status="open",
-                hold_days=(position.index[-1] - entry_date).days,
-            ))
-            open_mtm_series[symbol] = (close.loc[entry_date:] / entry_price - 1) * 1000
+        # regardless of when it entered. No exit signal yet, so "current
+        # price" stays today's close (the best available mark, not a fill).
+        if entry_signal_date is not None and position.iloc[-1] == 1:
+            entry_idx = position.index.get_loc(entry_signal_date)
+            if entry_idx + 1 < len(position):
+                entry_fill_date = position.index[entry_idx + 1]
+                entry_price, current_price = open_.loc[entry_fill_date], close.iloc[-1]
+                trades.append(dict(
+                    symbol=symbol, entry_date=entry_fill_date, exit_date=None,
+                    entry_price=entry_price, exit_price=current_price,
+                    roi=current_price / entry_price - 1, status="open",
+                    hold_days=(position.index[-1] - entry_fill_date).days,
+                ))
+                open_mtm_series[symbol] = (close.loc[entry_fill_date:] / entry_price - 1) * 1000
 
     conn.close()
     df = pd.DataFrame(trades)

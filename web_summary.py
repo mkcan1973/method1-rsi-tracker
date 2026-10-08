@@ -782,6 +782,8 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     validated via walk-forward backtesting across the S&amp;P 500 + core ETFs/index, then chosen over the
     original 30/55 textbook defaults via a grid search that replicated out-of-sample (see method1/threshold_grid.py
     and threshold_train_test.py). This page is a reporting view of that signal, not investment advice.
+    Entry/exit prices use the next trading day's OPEN after the signal-crossing close, since a close that
+    triggers RSI crossing a threshold isn't itself a tradeable price.
     <br><br>
     P/E @ entry is an approximation (entry price &divide; CURRENT trailing EPS, not the EPS that was actually
     current on the entry date) -- there's no free historical EPS series to compute it exactly. It's reasonably

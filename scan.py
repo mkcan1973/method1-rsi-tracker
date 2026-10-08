@@ -105,6 +105,8 @@ def main():
             print(f"... and {len(holding) - 15} more")
 
     print()
+    print("Execution convention: today's close is the signal, not a fill price --")
+    print("if trading this for real, place entries/exits at tomorrow's OPEN.")
     print("Signal only -- no orders placed.")
 
 
