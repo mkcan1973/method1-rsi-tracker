@@ -234,7 +234,7 @@ def _year_buttons_html(first_date: str, last_date: str) -> str:
     return "".join(f'<button class="toggle-btn" data-range="{y}">{y}</button>' for y in years_present)
 
 
-def _svg_mtm_chart(curve: list[dict]) -> str:
+def _svg_mtm_chart(curve: list[dict], open_mtm_series: dict) -> str:
     """One chart, three lines, one shared calendar axis: realized (step
     function, flat between exits), unrealized (sum of currently-open
     positions' mark-to-market P&L as of each date), and total (their sum).
@@ -244,15 +244,26 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
     whatever window is selected, which a statically-rendered SVG path
     can't do. Python's job is just to hand the complete daily series over.
 
+    Also embeds each currently-open position's own daily mark-to-market
+    series (OPEN_MTM) alongside the pre-aggregated curve, so the P/E
+    filter (page-level, build_body) can recompute realized/unrealized/
+    total from only the positions that pass it, instead of being stuck
+    with Python's unfiltered aggregate -- window.mtmSetData() lets the
+    page's filter handler push a recomputed curve in before re-rendering.
+
     The toggle bar itself lives at the page level (build_body), not here,
     since it now drives the stat tiles and tables too, not just this
-    chart -- this function only exposes window.mtmRender() for the page's
-    shared toggle handler to call.
+    chart -- this function only exposes window.mtmRender()/mtmSetData()
+    for the page's shared toggle/filter handler to call.
     """
     if len(curve) < 2:
         return '<p class="chart-note">Not enough data yet to chart.</p>'
 
     data_json = json.dumps(curve)
+    open_mtm_json = json.dumps({
+        symbol: [[d.strftime("%Y-%m-%d"), round(v, 2)] for d, v in series.items()]
+        for symbol, series in open_mtm_series.items()
+    })
 
     return f"""
     <div class="legend">
@@ -276,6 +287,8 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
     <script>
       (function() {{
         var ALL = {data_json};
+        var OPEN_MTM = {open_mtm_json};  // {{symbol: [[date, value], ...]}}, entry date to today
+        var CALENDAR_DATES = ALL.map(function(c) {{ return c.date; }});  // stable even if ALL is replaced
         var W = 1040, H = 300, PAD_L = 56, PAD_R = 16, PAD_T = 16, PAD_B = 28;
         var svg = document.getElementById('mtmSvg');
         var hoverRect = document.getElementById('hoverRect-mtm');
@@ -369,10 +382,15 @@ def _svg_mtm_chart(curve: list[dict]) -> str:
         // chart script itself -- it calls window.mtmRender(start, end)
         // whenever the selected window changes, so the chart stays in
         // sync with the stat tiles and tables under one shared control.
-        // window.mtmAll is also exposed so the CAGR tile can reuse the
-        // same n_active/total data without a second copy being embedded.
+        // mtmSetData lets the P/E filter push in a recomputed (filtered)
+        // curve before calling mtmRender, using mtmOpenMtm/mtmCalendarDates
+        // to do that recomputation itself.
         window.mtmRender = render;
         window.mtmAll = ALL;
+        window.mtmOriginalAll = ALL;  // stable reference to restore when the P/E filter clears
+        window.mtmSetData = function(newAll) {{ ALL = newAll; }};
+        window.mtmOpenMtm = OPEN_MTM;
+        window.mtmCalendarDates = CALENDAR_DATES;
       }})();
     </script>
     """
@@ -548,38 +566,108 @@ BODY_SCRIPT_TEMPLATE = """
     setTileValue('tileTotalPnl', fmtMoney(totalPnl), totalPnl >= 0 ? 'good num' : 'critical num');
     document.getElementById('tileTotalPnlSub').textContent = 'across ' + WINDOWED.closed.length + ' trades, $1,000 risk each';
 
-    if (window.mtmRender) window.mtmRender(startStr, endStr);
+    // Chart: when no P/E filter is active, restore Python's original
+    // (unfiltered) curve exactly rather than recomputing it -- cheaper and
+    // avoids any drift between the two code paths. When a filter IS
+    // active, rebuild realized/unrealized/total from only the trades that
+    // pass it, over the FULL calendar (render() does its own date-window
+    // slicing and rebasing on top of whatever curve it's given).
+    if (window.mtmSetData && window.mtmRender) {
+      if (peMin === null && peMax === null) {
+        if (window.mtmOriginalAll) window.mtmSetData(window.mtmOriginalAll);
+      } else {
+        window.mtmSetData(recomputeChartCurve(peOk));
+      }
+      window.mtmRender(startStr, endStr);
+    }
 
     // CAGR, computed the honest way (not by extrapolating trade frequency --
-    // see method1's own earlier false-start on that): compound the Total
-    // line's ACTUAL $ change over the window's REAL elapsed calendar days,
+    // see method1's own earlier false-start on that): compound the window's
+    // ACTUAL $ change (realized from WINDOWED.closed + each WINDOWED.open
+    // position's own unrealized ROI) over its REAL elapsed calendar days,
     // against a stated capital base of $1,000 x the average number of
-    // positions concurrently held during the window.
-    if (window.mtmAll) {
-      var sliced = window.mtmAll.filter(function(c) { return c.date >= startStr && (!endStr || c.date <= endStr); });
-      var cagrEl = document.getElementById('tileCagr'), subEl = document.getElementById('tileCagrSub');
-      if (sliced.length >= 2 && cagrEl) {
-        var base = sliced[0];
-        var finalTotal = sliced[sliced.length - 1].total - base.total;
-        var avgNActive = sliced.reduce(function(s, c) { return s + c.n_active; }, 0) / sliced.length;
-        var capitalBase = avgNActive * 1000;
-        var daysSpan = (new Date(sliced[sliced.length - 1].date) - new Date(sliced[0].date)) / 86400000;
-        var cagr = null;
-        if (capitalBase > 0 && daysSpan > 0) {
-          var totalReturnFrac = finalTotal / capitalBase;
-          if (totalReturnFrac > -1) { cagr = Math.pow(1 + totalReturnFrac, 365 / daysSpan) - 1; }
-        }
-        if (cagr !== null) {
-          setTileValue('tileCagr', (cagr >= 0 ? '+' : '') + (cagr * 100).toFixed(1) + '%', cagr >= 0 ? 'good' : 'critical');
-        } else {
-          setTileValue('tileCagr', 'n/a');
-        }
-        if (subEl) {
-          subEl.textContent = 'capital base: $' + Math.round(capitalBase).toLocaleString() +
-            ' (avg ' + avgNActive.toFixed(1) + ' positions × $1,000), ' + Math.round(daysSpan) + ' days';
-        }
+    // positions concurrently held -- both computed directly from the same
+    // date+P/E-filtered WINDOWED trades the tiles/tables use, via total
+    // time each trade overlaps the window (equivalent to averaging a daily
+    // active-count series, without needing to build one).
+    var cagrEl = document.getElementById('tileCagr'), subEl = document.getElementById('tileCagrSub');
+    if (cagrEl) {
+      var windowEndDate = endStr || TODAY;
+      var windowStartMs = new Date(startStr).getTime(), windowEndMs = new Date(windowEndDate).getTime();
+      var windowDays = (windowEndMs - windowStartMs) / 86400000;
+
+      function overlapDays(entryStr, exitStrOrNull) {
+        var entryMs = new Date(entryStr).getTime();
+        var exitMs = exitStrOrNull ? new Date(exitStrOrNull).getTime() : windowEndMs;
+        var startMs = Math.max(entryMs, windowStartMs);
+        var endMs = Math.min(exitMs, windowEndMs);
+        var days = (endMs - startMs) / 86400000;
+        return days > 0 ? days : 0;
+      }
+
+      var totalOverlapDays = 0;
+      WINDOWED.open.concat(WINDOWED.closed).forEach(function(r) {
+        totalOverlapDays += overlapDays(r.entry_date, r.exit_date);
+      });
+      var avgNActive = windowDays > 0 ? totalOverlapDays / windowDays : 0;
+      var capitalBase = avgNActive * 1000;
+      var finalTotal = totalPnl + openRois.reduce(function(a, b) { return a + b; }, 0) * 10;
+
+      var cagr = null;
+      if (capitalBase > 0 && windowDays > 0) {
+        var totalReturnFrac = finalTotal / capitalBase;
+        if (totalReturnFrac > -1) { cagr = Math.pow(1 + totalReturnFrac, 365 / windowDays) - 1; }
+      }
+      if (cagr !== null) {
+        setTileValue('tileCagr', (cagr >= 0 ? '+' : '') + (cagr * 100).toFixed(1) + '%', cagr >= 0 ? 'good' : 'critical');
+      } else {
+        setTileValue('tileCagr', 'n/a');
+      }
+      if (subEl) {
+        subEl.textContent = 'capital base: $' + Math.round(capitalBase).toLocaleString() +
+          ' (avg ' + avgNActive.toFixed(1) + ' positions × $1,000), ' + Math.round(windowDays) + ' days';
       }
     }
+  }
+
+  // Rebuilds the full-calendar realized/unrealized/total curve from only
+  // the trades that pass peOk -- the chart's equivalent of WINDOWED, just
+  // not date-restricted (render() does that part itself).
+  function recomputeChartCurve(peOk) {
+    var calendarDates = window.mtmCalendarDates || [];
+    var n = calendarDates.length;
+    var openFiltered = DATA.open.filter(peOk);
+    var closedFiltered = DATA.closed.filter(peOk);
+
+    var byExitDate = {};
+    closedFiltered.forEach(function(r) {
+      byExitDate[r.exit_date] = (byExitDate[r.exit_date] || 0) + r.roi * 10;
+    });
+    var realized = new Array(n), running = 0;
+    for (var i = 0; i < n; i++) {
+      var d = calendarDates[i];
+      if (byExitDate.hasOwnProperty(d)) { running += byExitDate[d]; }
+      realized[i] = running;
+    }
+
+    var unrealized = new Array(n).fill(0);
+    var openMtm = window.mtmOpenMtm || {};
+    openFiltered.forEach(function(r) {
+      var series = openMtm[r.symbol];
+      if (!series) return;
+      var si = 0, lastVal = 0, started = false;
+      for (var i = 0; i < n; i++) {
+        var d = calendarDates[i];
+        while (si < series.length && series[si][0] <= d) { lastVal = series[si][1]; si++; started = true; }
+        if (started) unrealized[i] += lastVal;
+      }
+    });
+
+    var curve = new Array(n);
+    for (var i = 0; i < n; i++) {
+      curve[i] = { date: calendarDates[i], realized: realized[i], unrealized: unrealized[i], total: realized[i] + unrealized[i] };
+    }
+    return curve;
   }
 
   var liveInput = document.getElementById('liveDateInput');
@@ -632,7 +720,7 @@ BODY_SCRIPT_TEMPLATE = """
 
 def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
                open_count_ytd: int, closed_count_ytd: int,
-               mtm_curve: list[dict], today: str) -> str:
+               mtm_curve: list[dict], open_mtm_series: dict, today: str) -> str:
     win_rate = stats["win_rate"] or 0
     avg_roi_closed = (stats["avg_roi_closed"] or 0) * 100
     avg_roi_open = (stats["avg_roi_open"] or 0) * 100
@@ -660,8 +748,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
       <input type="number" id="pe-max-global" placeholder="max">
     </label>
   </div>
-  <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E filter applies to the stat tiles and tables below
-    (not the chart, which is pre-aggregated by date and can't be re-sliced per-trade without a bigger rework).</div>
+  <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E filter applies to the stat tiles, chart, and tables below.</div>
 
   <div class="tiles">
     <div class="tile"><div class="label">Open positions</div><div class="value" id="tileOpenCount">{open_count_ytd}</div></div>
@@ -681,7 +768,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
 
   <h2>Realized, unrealized &amp; total P&amp;L</h2>
   <div class="panel">
-    {_svg_mtm_chart(mtm_curve)}
+    {_svg_mtm_chart(mtm_curve, open_mtm_series)}
     <div class="chart-note">All three lines normalized to $1,000/position, on the same calendar axis. Realized is a step function
       (flat between exits, jumps on each one); unrealized is the mark-to-market value of positions still open at each date
       (0 before a position's own entry date); total is their sum &mdash; today's rightmost point is your actual current P&amp;L.</div>
@@ -732,7 +819,7 @@ def main():
     open_count_ytd = int((log_ytd["status"] == "open").sum())
     closed_count_ytd = int((log_ytd["status"] == "closed").sum())
 
-    body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, today)
+    body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, open_mtm_series, today)
 
     full_html = f"""<!DOCTYPE html>
 <html lang="en">
