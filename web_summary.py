@@ -105,6 +105,7 @@ def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dic
     for r in sub.itertuples():
         eps = eps_by_symbol.get(r.symbol)
         pe_at_entry = round(r.entry_price / eps, 1) if eps and eps > 0 else None
+        eps_at_entry = round(eps, 2) if eps is not None else None
         out.append({
             "symbol": r.symbol,
             "entry_date": r.entry_date.strftime("%Y-%m-%d"),
@@ -114,6 +115,7 @@ def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dic
             "roi": round(r.roi * 100, 2),
             "hold_days": int(r.hold_days),
             "pe_at_entry": pe_at_entry,
+            "eps_at_entry": eps_at_entry,
         })
     return out
 
@@ -405,14 +407,14 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
     if status == "open":
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("entry_price", "Entry $"),
                 ("exit_price", "Now $"), ("roi", "Unrlzd ROI"), ("hold_days", "Days held"),
-                ("pe_at_entry", "P/E @ entry")]
+                ("pe_at_entry", "P/E @ entry"), ("eps_at_entry", "EPS @ entry")]
     else:
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("exit_date", "Exit"),
                 ("entry_price", "Entry $"), ("exit_price", "Exit $"), ("roi", "ROI"),
-                ("hold_days", "Hold days"), ("pe_at_entry", "P/E @ entry")]
+                ("hold_days", "Hold days"), ("pe_at_entry", "P/E @ entry"), ("eps_at_entry", "EPS @ entry")]
 
     header_cells = "".join(
-        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days","pe_at_entry") else ""}" '
+        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days","pe_at_entry","eps_at_entry") else ""}" '
         f'data-key="{k}" data-tbl="{table_id}">{label}</th>'
         for k, label in cols
     )
@@ -461,6 +463,10 @@ BODY_SCRIPT_TEMPLATE = """
     return (v === null || v === undefined) ? '&mdash;' : v.toFixed(1);
   }
 
+  function fmtEps(v) {
+    return (v === null || v === undefined) ? '&mdash;' : v.toFixed(2);
+  }
+
   function renderTable(tblId, rows, status) {
     var tbody = document.querySelector('#' + tblId + ' tbody');
     tbody.innerHTML = rows.map(function(r) {
@@ -473,6 +479,7 @@ BODY_SCRIPT_TEMPLATE = """
           '<td class="num">' + fmtRoi(r.roi) + '</td>' +
           '<td class="num">' + r.hold_days + '</td>' +
           '<td class="num">' + fmtPe(r.pe_at_entry) + '</td>' +
+          '<td class="num">' + fmtEps(r.eps_at_entry) + '</td>' +
           '</tr>';
       }
       return '<tr>' +
@@ -484,6 +491,7 @@ BODY_SCRIPT_TEMPLATE = """
         '<td class="num">' + fmtRoi(r.roi) + '</td>' +
         '<td class="num">' + r.hold_days + '</td>' +
         '<td class="num">' + fmtPe(r.pe_at_entry) + '</td>' +
+        '<td class="num">' + fmtEps(r.eps_at_entry) + '</td>' +
         '</tr>';
     }).join('');
   }
@@ -532,9 +540,18 @@ BODY_SCRIPT_TEMPLATE = """
     var peMinEl = document.getElementById('pe-min-global'), peMaxEl = document.getElementById('pe-max-global');
     var peMin = peMinEl && peMinEl.value !== '' ? parseFloat(peMinEl.value) : null;
     var peMax = peMaxEl && peMaxEl.value !== '' ? parseFloat(peMaxEl.value) : null;
+    var epsMinEl = document.getElementById('eps-min-global'), epsMaxEl = document.getElementById('eps-max-global');
+    var epsMin = epsMinEl && epsMinEl.value !== '' ? parseFloat(epsMinEl.value) : null;
+    var epsMax = epsMaxEl && epsMaxEl.value !== '' ? parseFloat(epsMaxEl.value) : null;
+    // Still named peOk (not renamed to e.g. filterOk) to keep this diff to
+    // the places that actually need to know about EPS -- every existing
+    // caller (recomputeChartCurve, the WINDOWED filters below) already
+    // takes "the global row filter" as a single predicate by this name.
     function peOk(r) {
       if (peMin !== null && (r.pe_at_entry === null || r.pe_at_entry < peMin)) return false;
       if (peMax !== null && (r.pe_at_entry === null || r.pe_at_entry > peMax)) return false;
+      if (epsMin !== null && (r.eps_at_entry === null || r.eps_at_entry < epsMin)) return false;
+      if (epsMax !== null && (r.eps_at_entry === null || r.eps_at_entry > epsMax)) return false;
       return true;
     }
 
@@ -697,9 +714,9 @@ BODY_SCRIPT_TEMPLATE = """
     if (liveInput.value) { applyDateWindow(liveInput.value, null); }
   });
 
-  // The global P/E filter re-applies the CURRENT date window on every
-  // edit, rather than needing its own copy of which toggle is active.
-  ['pe-min-global', 'pe-max-global'].forEach(function(id) {
+  // The global P/E and EPS filters re-apply the CURRENT date window on
+  // every edit, rather than needing their own copy of which toggle is active.
+  ['pe-min-global', 'pe-max-global', 'eps-min-global', 'eps-max-global'].forEach(function(id) {
     document.getElementById(id).addEventListener('input', function() {
       if (currentWindowStart !== null) { applyDateWindow(currentWindowStart, currentWindowEnd); }
     });
@@ -747,8 +764,13 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
       <span>&ndash;</span>
       <input type="number" id="pe-max-global" placeholder="max">
     </label>
+    <label class="pe-filter-label">EPS @ entry
+      <input type="number" id="eps-min-global" placeholder="min">
+      <span>&ndash;</span>
+      <input type="number" id="eps-max-global" placeholder="max">
+    </label>
   </div>
-  <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E filter applies to the stat tiles, chart, and tables below.</div>
+  <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E and EPS filters apply to the stat tiles, chart, and tables below.</div>
 
   <div class="tiles">
     <div class="tile"><div class="label">Open positions</div><div class="value" id="tileOpenCount">{open_count_ytd}</div></div>
@@ -785,11 +807,12 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     Entry/exit prices use the next trading day's OPEN after the signal-crossing close, since a close that
     triggers RSI crossing a threshold isn't itself a tradeable price.
     <br><br>
-    P/E @ entry is an approximation (entry price &divide; CURRENT trailing EPS, not the EPS that was actually
-    current on the entry date) -- there's no free historical EPS series to compute it exactly. It's reasonably
-    accurate for trades entered in the last ~2 quarters and increasingly approximate for older ones, since EPS
-    changes every earnings report. Trades in unprofitable companies (negative/missing EPS) show as &mdash; and
-    are excluded by the P/E filter, not treated as having a P/E of zero.
+    P/E and EPS @ entry are both approximations (P/E = entry price &divide; CURRENT trailing EPS; EPS is that
+    same CURRENT trailing figure directly) -- neither is the EPS that was actually current on the entry date,
+    since there's no free historical EPS series to compute it exactly. Reasonably accurate for trades entered
+    in the last ~2 quarters and increasingly approximate for older ones, since EPS changes every earnings
+    report. Trades with no reported EPS show as &mdash; for both and are excluded by either filter, not
+    treated as having a P/E or EPS of zero.
   </footer>
 </div>
 {BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{today}", today)}
