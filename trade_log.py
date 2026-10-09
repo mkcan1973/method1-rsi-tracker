@@ -23,15 +23,22 @@ import features
 import indicators
 from universe import tradeable_tickers
 from stock_universe import get_sp500_tickers
+from russell2000 import get_russell2000_tickers
 
 
 # Fixed anchor rather than "N months ago from today": the web dashboard's
-# 2023 / 2024 / 2025 / 2026 YTD / Live toggle needs full-year data available
-# at all times for each of those years, not just a trailing window that
-# would eventually slide past them. ~3 months of warmup before 2023-01-01
-# covers even the 50-day MA. prune.py's KEEP_DAYS derives from this
-# constant automatically -- revisit this when adding a 2027 button.
-DEFAULT_START_DATE = "2022-10-01"
+# year-toggle buttons need full-year data available at all times for
+# each year shown, not just a trailing window that would eventually slide
+# past them. Pulled forward from 2022-10-01 to 2025-01-01 (losing the
+# 2023/2024 buttons) specifically because adding Russell 2000 made the
+# per-day data footprint ~4.5x bigger -- the old anchor's DB no longer
+# fits GitHub's 100MB hard per-file push limit (was 226MB pruned to
+# 1588 days). This only applies to the deployed tracker's copy of this
+# constant; the local research copy keeps full history and has no such
+# constraint. prune.py's KEEP_DAYS derives from this constant
+# automatically -- revisit both the anchor and the size math before
+# adding a 2027 button.
+DEFAULT_START_DATE = "2025-06-01"
 
 
 def build_trade_log(start_date: str = DEFAULT_START_DATE) -> pd.DataFrame:
@@ -50,7 +57,7 @@ def build_trade_log_with_mtm(start_date: str = DEFAULT_START_DATE) -> tuple[pd.D
     for every currently-open position.
     """
     conn = data_db.connect()
-    symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers()))
+    symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers() + get_russell2000_tickers()))
     cutoff = pd.Timestamp(start_date)
 
     trades = []

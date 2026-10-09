@@ -28,6 +28,7 @@ import features
 import indicators
 from universe import tradeable_tickers
 from stock_universe import get_sp500_tickers
+from russell2000 import get_russell2000_tickers
 
 RSI_BUY = 20
 RSI_EXIT = 65
@@ -72,7 +73,7 @@ def main():
     print()
 
     conn = data_db.connect()
-    symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers()))
+    symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers() + get_russell2000_tickers()))
     rows = [r for r in (scan_symbol(conn, s) for s in symbols) if r is not None]
     conn.close()
 
