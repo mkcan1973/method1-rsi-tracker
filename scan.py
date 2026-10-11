@@ -17,14 +17,18 @@ trade on ~100% of weeks, vs. a handful of times a year for the streak rule.
 Signal/alert only: this prints what's actionable today. It places no orders.
 
 Discord notifications: entries/exits are also posted to Discord (best
-effort, see notify.py), filtered to P/E @ entry < NOTIFY_PE_MAX and EPS
-> NOTIFY_EPS_MIN -- not because the underlying RSI signal uses P/E or EPS
-(it doesn't; every symbol trades on the same rule), but because
-cagr_by_year_pe.py / cagr_by_year_eps.py's local backtests showed that
-subset of trades outperforming in 2023-2025. The filter narrows what you
-get PINGED about, not what the dashboard tracks or what the strategy
-trades -- the full, unfiltered signal is still in scan_results.csv and on
-the dashboard with its own live P/E/EPS filter fields.
+effort, see notify.py), filtered to P/E @ entry and EPS thresholds read
+from notify_thresholds.json (see notify.get_notify_thresholds) -- not
+because the underlying RSI signal uses P/E or EPS (it doesn't; every
+symbol trades on the same rule), but because cagr_by_year_pe.py /
+cagr_by_year_eps.py's local backtests showed a P/E<30, EPS>0 subset of
+trades outperforming in 2023-2025. The filter narrows what you get
+PINGED about, not what the dashboard tracks or what the strategy trades
+-- the full, unfiltered signal is still in scan_results.csv and on the
+dashboard with its own live P/E/EPS filter fields. To change the
+threshold without touching code, edit notify_thresholds.json directly
+(e.g. via GitHub's web/mobile file editor) and commit -- the next scan
+run picks it up.
 """
 
 from pathlib import Path
@@ -44,9 +48,6 @@ from russell2000 import get_russell2000_tickers
 
 RSI_BUY = 20
 RSI_EXIT = 65
-
-NOTIFY_PE_MAX = 30
-NOTIFY_EPS_MIN = 0
 
 SUMMARY_CSV = Path(__file__).with_name("scan_results.csv")
 
@@ -121,23 +122,27 @@ def main():
     else:
         print("Nothing new today.")
 
+    thresholds = notify.get_notify_thresholds()
+    pe_max, eps_min = thresholds["pe_max"], thresholds["eps_min"]
     notify_rows = actionable[
-        (actionable["pe"].notna()) & (actionable["pe"] < NOTIFY_PE_MAX)
-        & (actionable["eps"].notna()) & (actionable["eps"] > NOTIFY_EPS_MIN)
+        (actionable["pe"].notna()) & (actionable["pe"] < pe_max)
+        & (actionable["eps"].notna()) & (actionable["eps"] > eps_min)
     ]
     if not notify_rows.empty:
         lines = [
-            f"{'+' if r.status == 'NEW_ENTRY' else '-'} {r.status:9s} {r.symbol:6s} "
-            f"RSI={r.rsi_14:5.1f}  P/E={r.pe:5.1f}  EPS={r.eps:6.2f}"
+            f"{'+' if r.status == 'NEW_ENTRY' else '-'} "
+            f"{'BUY ' if r.status == 'NEW_ENTRY' else 'SELL'}  {r.symbol:6s} ${r.close:<10.2f} "
+            f"(RSI={r.rsi_14:5.1f}  P/E={r.pe:5.1f}  EPS={r.eps:6.2f})"
             for r in notify_rows.itertuples()
         ]
         message = (
-            f"**method1 RSI signal -- {as_of}** (P/E < {NOTIFY_PE_MAX}, EPS > {NOTIFY_EPS_MIN})\n"
+            f"**method1 RSI signal -- {as_of}** (P/E < {pe_max:g}, EPS > {eps_min:g})\n"
             "```diff\n" + "\n".join(lines) + "\n```\n"
             "<https://mkcan1973.github.io/method1-rsi-tracker/>"
         )
         notify.notify_discord(message)
-        print(f"\nSent Discord notification: {len(notify_rows)} signal(s) passed the P/E+EPS filter.")
+        print(f"\nSent Discord notification: {len(notify_rows)} signal(s) passed the P/E+EPS filter "
+              f"(P/E < {pe_max:g}, EPS > {eps_min:g}).")
 
     holding = df[df["status"] == "HOLDING"].sort_values("symbol")
     if not holding.empty:

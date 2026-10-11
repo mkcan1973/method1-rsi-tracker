@@ -9,6 +9,14 @@ public repo). The deployed GitHub Actions run instead reads it from the
 DISCORD_WEBHOOK_URL environment variable, set as an encrypted repo
 secret (`gh secret set DISCORD_WEBHOOK_URL --repo mkcan1973/method1-rsi-tracker`),
 never stored in plaintext in the repo.
+
+Notify thresholds (P/E max, EPS min) are a SEPARATE, non-sensitive
+config file (notify_thresholds.json) that IS committed -- unlike the
+webhook URL, there's nothing to protect here, and committing it is what
+makes it editable straight from GitHub's web/mobile file editor without
+touching any code: open the file, change a number, commit. The next
+scan.py run (the daily scheduled one, or a manual workflow_dispatch)
+picks it up automatically.
 """
 
 import json
@@ -17,6 +25,8 @@ import urllib.request
 from pathlib import Path
 
 CONFIG_FILE = Path(__file__).with_name("notify_config.json")
+THRESHOLDS_FILE = Path(__file__).with_name("notify_thresholds.json")
+DEFAULT_THRESHOLDS = {"pe_max": 30, "eps_min": 0}
 
 
 def get_webhook_url() -> str | None:
@@ -29,6 +39,23 @@ def get_webhook_url() -> str | None:
         except Exception:
             return None
     return None
+
+
+def get_notify_thresholds() -> dict:
+    """{"pe_max": ..., "eps_min": ...} -- falls back to DEFAULT_THRESHOLDS
+    if the file is missing or malformed, so a typo'd edit degrades to the
+    known-good defaults instead of breaking the scan.
+    """
+    if THRESHOLDS_FILE.exists():
+        try:
+            data = json.loads(THRESHOLDS_FILE.read_text())
+            return {
+                "pe_max": float(data.get("pe_max", DEFAULT_THRESHOLDS["pe_max"])),
+                "eps_min": float(data.get("eps_min", DEFAULT_THRESHOLDS["eps_min"])),
+            }
+        except Exception:
+            pass
+    return dict(DEFAULT_THRESHOLDS)
 
 
 def notify_discord(message: str, webhook_url: str | None = None) -> None:
