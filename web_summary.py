@@ -21,7 +21,18 @@ import pandas as pd
 
 import data_db
 from fundamentals import get_trailing_eps
-from trade_log import DEFAULT_START_DATE, build_trade_log_with_mtm, summarize
+from trade_log import DEFAULT_START_DATE, build_trade_log_with_mtm, build_frozen_year_trade_log, summarize
+
+# Years with a static, entry-year-bucketed snapshot instead of live DB
+# coverage (see trade_log.build_frozen_year_trade_log). Each one is
+# permanently fixed once computed -- today's date is already past all of
+# them, so no trade can ever newly enter one -- so they're computed ONCE
+# and cached to disk rather than rebuilt on every dashboard run (each
+# year's reconstruction scans the full multi-thousand-symbol universe and
+# takes several minutes; redoing that on every daily CI run for data that
+# can never change again would be pure waste).
+HISTORICAL_YEARS = [2023, 2024, 2025]
+HISTORICAL_CACHE_DIR = Path(__file__).with_name("historical_cache")
 
 FULL_HTML_PATH = Path(__file__).with_name("web_summary.html")
 
@@ -117,6 +128,34 @@ def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dic
             "pe_at_entry": pe_at_entry,
             "eps_at_entry": eps_at_entry,
         })
+    return out
+
+
+def get_historical_rows(force_refresh: bool = False) -> dict:
+    """{year_str: [row, ...]} for every year in HISTORICAL_YEARS, cached
+    to disk since each year is now permanently fixed (see
+    HISTORICAL_YEARS' comment) and expensive to recompute. P/E and EPS
+    values get baked in using whatever trailing EPS was fetchable AT
+    CACHE TIME and never refreshed afterward -- a deliberate choice, not
+    an oversight: these are explicitly frozen "as of" views, so freezing
+    their approximate P/E/EPS alongside everything else is more
+    consistent than letting just that one field keep drifting.
+    """
+    HISTORICAL_CACHE_DIR.mkdir(exist_ok=True)
+    out = {}
+    for year in HISTORICAL_YEARS:
+        cache_file = HISTORICAL_CACHE_DIR / f"{year}.json"
+        if not force_refresh and cache_file.exists():
+            out[str(year)] = json.loads(cache_file.read_text())
+            continue
+        df = build_frozen_year_trade_log(year)
+        if df.empty:
+            out[str(year)] = []
+            continue
+        eps_by_symbol = get_trailing_eps(sorted(df["symbol"].unique()))
+        rows = _rows_for_js(df, "closed", eps_by_symbol)
+        cache_file.write_text(json.dumps(rows))
+        out[str(year)] = rows
     return out
 
 
@@ -222,16 +261,23 @@ STYLE = """
 HEAD_LINK = '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">'
 
 
-def _year_buttons_html(first_date: str, last_date: str) -> str:
+def _year_buttons_html(first_date: str, last_date: str, exclude: set[str] = frozenset()) -> str:
     """One button per COMPLETE calendar year the data covers (data starts
     partway through DEFAULT_START_DATE's year, and the current year is
     handled by the YTD button instead).
+
+    `exclude` skips any year that already has its own static historical
+    snapshot (get_historical_rows) -- on the deployed tracker this never
+    matters (its live window is too short to reach 2023-2025 at all), but
+    the local research copy's live DB still covers the full history, so
+    without this it would render the SAME year twice: once as a dynamic
+    live-data button, once as the static frozen-snapshot button.
     """
     current_year = last_date[:4]
     start_year, end_year = int(first_date[:4]), int(last_date[:4])
     years_present = [
         str(y) for y in range(start_year, end_year + 1)
-        if str(y) != current_year and f"{y}-01-01" >= first_date
+        if str(y) != current_year and f"{y}-01-01" >= first_date and str(y) not in exclude
     ]
     return "".join(f'<button class="toggle-btn" data-range="{y}">{y}</button>' for y in years_present)
 
@@ -439,6 +485,12 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
 BODY_SCRIPT_TEMPLATE = """
 <script>
   var DATA = {data_json};
+  // Static, entry-year-bucketed snapshots for years the live DB no longer
+  // carries price history for (see trade_log.build_frozen_year_trade_log
+  // and histModeNote) -- a handful of KB of trade rows, not years of
+  // daily OHLCV, which is what made keeping those years "live" too big
+  // for GitHub's 100MB push limit once Russell 2000 was added.
+  window.HIST_DATA = {hist_data_json};
   var TODAY = "{today}";
   // The window-filtered (by the shared toggle) subset each table/tile
   // actually reads from -- separate from DATA itself, which always holds
@@ -528,14 +580,22 @@ BODY_SCRIPT_TEMPLATE = """
     applyFilter(status);
   }
 
-  // Tracks the currently-selected date window so the global P/E filter
-  // (which lives in the toggle bar, not per-table) can re-apply it without
-  // needing its own copy of which toggle button is active.
-  var currentWindowStart = null, currentWindowEnd = null;
+  // Tracks the currently-selected date window (and, for a historical
+  // year, which static dataset it came from) so the global P/E filter
+  // (which lives in the toggle bar, not per-table) can re-apply it
+  // without needing its own copy of which toggle button is active.
+  var currentWindowStart = null, currentWindowEnd = null, currentHistRows = null;
 
-  function applyDateWindow(startStr, endStr) {
+  // histRows: omit for the live window (filters DATA.open/DATA.closed by
+  // date as before). Pass a HIST_DATA[year] array for a historical year
+  // -- every one of those rows is already a closed, entry-year-bucketed
+  // trade (see trade_log.build_frozen_year_trade_log's docstring), so
+  // WINDOWED.open is simply empty and no date-range filtering is needed
+  // (the dataset is already scoped to exactly that year).
+  function applyDateWindow(startStr, endStr, histRows) {
     currentWindowStart = startStr;
     currentWindowEnd = endStr;
+    currentHistRows = histRows || null;
 
     var peMinEl = document.getElementById('pe-min-global'), peMaxEl = document.getElementById('pe-max-global');
     var peMin = peMinEl && peMinEl.value !== '' ? parseFloat(peMinEl.value) : null;
@@ -555,12 +615,17 @@ BODY_SCRIPT_TEMPLATE = """
       return true;
     }
 
-    WINDOWED.open = DATA.open.filter(function(r) {
-      return r.entry_date >= startStr && (!endStr || r.entry_date <= endStr) && peOk(r);
-    });
-    WINDOWED.closed = DATA.closed.filter(function(r) {
-      return r.exit_date >= startStr && (!endStr || r.exit_date <= endStr) && peOk(r);
-    });
+    if (histRows) {
+      WINDOWED.open = [];
+      WINDOWED.closed = histRows.filter(peOk);
+    } else {
+      WINDOWED.open = DATA.open.filter(function(r) {
+        return r.entry_date >= startStr && (!endStr || r.entry_date <= endStr) && peOk(r);
+      });
+      WINDOWED.closed = DATA.closed.filter(function(r) {
+        return r.exit_date >= startStr && (!endStr || r.exit_date <= endStr) && peOk(r);
+      });
+    }
     sortState = {};
 
     document.getElementById('header-count-open').textContent = '(' + WINDOWED.open.length + ')';
@@ -583,19 +648,31 @@ BODY_SCRIPT_TEMPLATE = """
     setTileValue('tileTotalPnl', fmtMoney(totalPnl), totalPnl >= 0 ? 'good num' : 'critical num');
     document.getElementById('tileTotalPnlSub').textContent = 'across ' + WINDOWED.closed.length + ' trades, $1,000 risk each';
 
-    // Chart: when no P/E filter is active, restore Python's original
+    // Chart: no daily price series is shipped for historical years (that's
+    // the whole reason they're static JSON instead of DATA, see
+    // histModeNote), so hide it and show the explanatory note instead.
+    // Live mode: when no P/E filter is active, restore Python's original
     // (unfiltered) curve exactly rather than recomputing it -- cheaper and
     // avoids any drift between the two code paths. When a filter IS
     // active, rebuild realized/unrealized/total from only the trades that
     // pass it, over the FULL calendar (render() does its own date-window
     // slicing and rebasing on top of whatever curve it's given).
-    if (window.mtmSetData && window.mtmRender) {
-      if (peMin === null && peMax === null) {
-        if (window.mtmOriginalAll) window.mtmSetData(window.mtmOriginalAll);
-      } else {
-        window.mtmSetData(recomputeChartCurve(peOk));
+    var chartSectionEl = document.getElementById('chartSection');
+    var histNoteEl = document.getElementById('histModeNote');
+    if (histRows) {
+      if (chartSectionEl) chartSectionEl.style.display = 'none';
+      if (histNoteEl) histNoteEl.style.display = '';
+    } else {
+      if (chartSectionEl) chartSectionEl.style.display = '';
+      if (histNoteEl) histNoteEl.style.display = 'none';
+      if (window.mtmSetData && window.mtmRender) {
+        if (peMin === null && peMax === null) {
+          if (window.mtmOriginalAll) window.mtmSetData(window.mtmOriginalAll);
+        } else {
+          window.mtmSetData(recomputeChartCurve(peOk));
+        }
+        window.mtmRender(startStr, endStr);
       }
-      window.mtmRender(startStr, endStr);
     }
 
     // CAGR, computed the honest way (not by extrapolating trade frequency --
@@ -705,6 +782,8 @@ BODY_SCRIPT_TEMPLATE = """
       setActiveToggle(btn);
       if (range === 'ytd') {
         applyDateWindow(TODAY.slice(0, 4) + '-01-01', null);
+      } else if (window.HIST_DATA && window.HIST_DATA[range]) {
+        applyDateWindow(range + '-01-01', range + '-12-31', window.HIST_DATA[range]);
       } else {
         applyDateWindow(range + '-01-01', range + '-12-31');
       }
@@ -718,7 +797,7 @@ BODY_SCRIPT_TEMPLATE = """
   // every edit, rather than needing their own copy of which toggle is active.
   ['pe-min-global', 'pe-max-global', 'eps-min-global', 'eps-max-global'].forEach(function(id) {
     document.getElementById(id).addEventListener('input', function() {
-      if (currentWindowStart !== null) { applyDateWindow(currentWindowStart, currentWindowEnd); }
+      if (currentWindowStart !== null) { applyDateWindow(currentWindowStart, currentWindowEnd, currentHistRows); }
     });
   });
 
@@ -737,14 +816,25 @@ BODY_SCRIPT_TEMPLATE = """
 
 def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
                open_count_ytd: int, closed_count_ytd: int,
-               mtm_curve: list[dict], open_mtm_series: dict, today: str) -> str:
+               mtm_curve: list[dict], open_mtm_series: dict, today: str,
+               hist_rows: dict | None = None) -> str:
     win_rate = stats["win_rate"] or 0
     avg_roi_closed = (stats["avg_roi_closed"] or 0) * 100
     avg_roi_open = (stats["avg_roi_open"] or 0) * 100
     total_pnl = stats["total_normalized_pnl"]
 
     data_json = json.dumps({"open": open_rows, "closed": closed_rows})
-    year_buttons = _year_buttons_html(mtm_curve[0]["date"], mtm_curve[-1]["date"]) if len(mtm_curve) >= 2 else ""
+    hist_rows = hist_rows or {}
+    hist_data_json = json.dumps(hist_rows)
+    # Static historical years are a SEPARATE button set from
+    # _year_buttons_html's dynamic ones (which only covers whatever full
+    # years the live, trailing-window DB happens to still carry price
+    # history for -- none, now that DEFAULT_START_DATE is mid-2025).
+    hist_year_buttons = "".join(
+        f'<button class="toggle-btn" data-range="{y}">{y}</button>' for y in sorted(hist_rows)
+    )
+    year_buttons = (_year_buttons_html(mtm_curve[0]["date"], mtm_curve[-1]["date"], exclude=set(hist_rows))
+                     if len(mtm_curve) >= 2 else "")
     live_min = mtm_curve[0]["date"] if mtm_curve else today
     live_max = mtm_curve[-1]["date"] if mtm_curve else today
 
@@ -755,6 +845,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
   <div class="asof">As of {today} &middot; signal only, no orders placed &middot; normalized to $1,000 risked per trade</div>
 
   <div class="togglebar">
+    {hist_year_buttons}
     {year_buttons}
     <button class="toggle-btn" data-range="ytd">{today[:4]} YTD</button>
     <button class="toggle-btn" data-range="live">Live from...</button>
@@ -788,12 +879,21 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
       <div class="sub" id="tileCagrSub"></div></div>
   </div>
 
-  <h2>Realized, unrealized &amp; total P&amp;L</h2>
-  <div class="panel">
-    {_svg_mtm_chart(mtm_curve, open_mtm_series)}
-    <div class="chart-note">All three lines normalized to $1,000/position, on the same calendar axis. Realized is a step function
-      (flat between exits, jumps on each one); unrealized is the mark-to-market value of positions still open at each date
-      (0 before a position's own entry date); total is their sum &mdash; today's rightmost point is your actual current P&amp;L.</div>
+  <div id="chartSection">
+    <h2>Realized, unrealized &amp; total P&amp;L</h2>
+    <div class="panel">
+      {_svg_mtm_chart(mtm_curve, open_mtm_series)}
+      <div class="chart-note">All three lines normalized to $1,000/position, on the same calendar axis. Realized is a step function
+        (flat between exits, jumps on each one); unrealized is the mark-to-market value of positions still open at each date
+        (0 before a position's own entry date); total is their sum &mdash; today's rightmost point is your actual current P&amp;L.</div>
+    </div>
+  </div>
+  <div id="histModeNote" class="chart-note" style="display:none; margin: 8px 0 14px;">
+    Historical year view: every trade is bucketed by its ENTRY year (like a fund's "vintage year" reporting), not by when it
+    exited. A position still open at that year's own Dec 31 is marked closed at that date's price, not today's -- this view
+    never changes once the year is over. No daily P&amp;L chart for historical years (would need the full price history kept
+    around just for that, which is what made the live DB too big for GitHub in the first place); the stat tiles and tables
+    below have everything that matters.
   </div>
 
   {_table_section("Open positions", open_rows, "open", open_count_ytd)}
@@ -815,7 +915,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     treated as having a P/E or EPS of zero.
   </footer>
 </div>
-{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{today}", today)}
+{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{hist_data_json}", hist_data_json).replace("{today}", today)}
 """
 
 
@@ -844,7 +944,10 @@ def main():
     open_count_ytd = int((log_ytd["status"] == "open").sum())
     closed_count_ytd = int((log_ytd["status"] == "closed").sum())
 
-    body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, open_mtm_series, today)
+    hist_rows = get_historical_rows()
+
+    body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, open_mtm_series,
+                       today, hist_rows)
 
     full_html = f"""<!DOCTYPE html>
 <html lang="en">

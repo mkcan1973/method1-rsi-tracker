@@ -129,6 +129,92 @@ def build_trade_log_with_mtm(start_date: str = DEFAULT_START_DATE) -> tuple[pd.D
     return df, open_mtm_series
 
 
+def build_frozen_year_trade_log(year: int) -> pd.DataFrame:
+    """Same reconstruction as build_trade_log_with_mtm(), but for a
+    CLOSED historical year, bucketed by ENTRY year (like a fund's
+    "vintage year" reporting) rather than exit year: every trade here
+    ENTERED in `year`, whatever happened to it afterward. A trade that
+    entered in `year` and hasn't closed for real by that year's Dec 31
+    is marked closed AT that cutoff's price -- bars are truncated there,
+    so close.iloc[-1] IS the cutoff price -- rather than left open or
+    using today's live (and constantly-changing) price.
+
+    Entry-year bucketing means each position appears in EXACTLY ONE
+    year's table, never duplicated across years (an earlier exit-year
+    + independent-snapshot approach would show a multi-year-held
+    position once per year-end it straddled, which inflated every
+    year's trade count and double-counted the same position).
+
+    Deliberately NOT parameterized to also take today's real EPS for a
+    point-in-time P/E -- see fundamentals.py's docstring and the rest of
+    this project's P/E-at-entry caveat: using CURRENT trailing EPS
+    consistently (live view and every frozen year alike) is the existing,
+    already-communicated approximation, not a new one introduced here.
+    """
+    conn = data_db.connect()
+    symbols = list(dict.fromkeys(tradeable_tickers() + get_sp500_tickers() + get_russell2000_tickers()))
+    cutoff = pd.Timestamp(f"{year}-12-31")
+
+    trades = []
+    for symbol in symbols:
+        bars = data_db.load_bars(conn, symbol)
+        if bars is None:
+            continue
+        bars = bars.loc[:cutoff]
+        if len(bars) < 120:
+            continue
+        feats = features.build_features(bars)
+        position = indicators.rsi_reversion(feats).fillna(0)
+        close, open_ = bars["close"], bars["open"]
+
+        entry_signal_date = None
+        for i in range(1, len(position)):
+            prev, curr = position.iloc[i - 1], position.iloc[i]
+            date = position.index[i]
+            if prev == 0 and curr == 1:
+                entry_signal_date = date
+            elif prev == 1 and curr == 0 and entry_signal_date is not None:
+                entry_idx = position.index.get_loc(entry_signal_date)
+                exit_idx = position.index.get_loc(date)
+                if entry_idx + 1 >= len(position) or exit_idx + 1 >= len(position):
+                    entry_signal_date = None
+                    continue
+                entry_fill_date = position.index[entry_idx + 1]
+                exit_fill_date = position.index[exit_idx + 1]
+                if entry_fill_date.year == year:
+                    entry_price, exit_price = open_.loc[entry_fill_date], open_.loc[exit_fill_date]
+                    trades.append(dict(
+                        symbol=symbol, entry_date=entry_fill_date, exit_date=exit_fill_date,
+                        entry_price=entry_price, exit_price=exit_price,
+                        roi=exit_price / entry_price - 1, status="closed",
+                        hold_days=(exit_fill_date - entry_fill_date).days,
+                    ))
+                entry_signal_date = None
+
+        # Entered in `year` but still open as of ITS OWN year-end cutoff:
+        # mark it closed AT the cutoff price (close.iloc[-1] IS the
+        # cutoff's close, since bars were truncated there), not left
+        # dangling as an open position or priced off today's live data.
+        if entry_signal_date is not None and position.iloc[-1] == 1:
+            entry_idx = position.index.get_loc(entry_signal_date)
+            if entry_idx + 1 < len(position):
+                entry_fill_date = position.index[entry_idx + 1]
+                if entry_fill_date.year == year:
+                    entry_price, cutoff_price = open_.loc[entry_fill_date], close.iloc[-1]
+                    trades.append(dict(
+                        symbol=symbol, entry_date=entry_fill_date, exit_date=position.index[-1],
+                        entry_price=entry_price, exit_price=cutoff_price,
+                        roi=cutoff_price / entry_price - 1, status="closed",
+                        hold_days=(position.index[-1] - entry_fill_date).days,
+                    ))
+
+    conn.close()
+    df = pd.DataFrame(trades)
+    if not df.empty:
+        df = df.sort_values("entry_date", ascending=False)
+    return df
+
+
 def summarize(df: pd.DataFrame) -> dict:
     closed = df[df["status"] == "closed"]
     open_ = df[df["status"] == "open"]
