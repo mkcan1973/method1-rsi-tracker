@@ -853,10 +853,10 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     <label class="pe-filter-label">P/E @ entry
       <input type="number" id="pe-min-global" placeholder="min">
       <span>&ndash;</span>
-      <input type="number" id="pe-max-global" placeholder="max">
+      <input type="number" id="pe-max-global" placeholder="max" value="10">
     </label>
     <label class="pe-filter-label">EPS @ entry
-      <input type="number" id="eps-min-global" placeholder="min">
+      <input type="number" id="eps-min-global" placeholder="min" value="0">
       <span>&ndash;</span>
       <input type="number" id="eps-max-global" placeholder="max">
     </label>
