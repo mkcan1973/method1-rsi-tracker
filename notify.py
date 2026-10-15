@@ -29,13 +29,29 @@ THRESHOLDS_FILE = Path(__file__).with_name("notify_thresholds.json")
 DEFAULT_THRESHOLDS = {"pe_max": 30, "eps_min": 0}
 
 
+def _clean_url(url: str | None) -> str | None:
+    """Strip whitespace and a leading UTF-8 BOM (U+FEFF) -- found the hard
+    way: setting the DISCORD_WEBHOOK_URL GitHub secret via a PowerShell
+    pipe silently prepended a BOM to the value, which urllib's scheme
+    parser doesn't recognize ("unknown url type: <BOM>https"). The
+    try/except in notify_discord() swallowed that error every single
+    day without ever actually sending anything, invisibly, since it was
+    first set -- defend here so a future secret/env edit through some
+    other BOM-adding path (there are several on Windows) can't silently
+    repeat it.
+    """
+    if url is None:
+        return None
+    return url.strip().lstrip("﻿") or None
+
+
 def get_webhook_url() -> str | None:
     env_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if env_url:
-        return env_url
+        return _clean_url(env_url)
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text()).get("discord_webhook_url")
+            return _clean_url(json.loads(CONFIG_FILE.read_text()).get("discord_webhook_url"))
         except Exception:
             return None
     return None
