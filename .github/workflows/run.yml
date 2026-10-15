@@ -32,7 +32,8 @@ jobs:
       - name: TEMP -- verify Discord webhook fix
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python -c "import notify; notify.notify_discord('method1-tracker: CI webhook verification -- BOM fix check, ignore this message.')"
+        run: |
+          python -c "import notify; notify.notify_discord('method1-tracker CI webhook verification (BOM fix check), ignore this message.')"
 
       - name: Scan (refreshes data + today's RSI scan)
         env:
