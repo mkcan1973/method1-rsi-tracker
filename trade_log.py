@@ -119,6 +119,10 @@ def build_trade_log_with_mtm(start_date: str = DEFAULT_START_DATE) -> tuple[pd.D
                     entry_price=entry_price, exit_price=current_price,
                     roi=current_price / entry_price - 1, status="open",
                     hold_days=(position.index[-1] - entry_fill_date).days,
+                    # How close to the RSI>=65 exit, as of the latest
+                    # close -- a plain snapshot, not a prediction of
+                    # tomorrow's RSI.
+                    rsi_14=feats["rsi_14"].iloc[-1],
                 ))
                 open_mtm_series[symbol] = (close.loc[entry_fill_date:] / entry_price - 1) * 1000
 

@@ -117,6 +117,7 @@ def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dic
         eps = eps_by_symbol.get(r.symbol)
         pe_at_entry = round(r.entry_price / eps, 1) if eps and eps > 0 else None
         eps_at_entry = round(eps, 2) if eps is not None else None
+        rsi_now = getattr(r, "rsi_14", None)
         out.append({
             "symbol": r.symbol,
             "entry_date": r.entry_date.strftime("%Y-%m-%d"),
@@ -127,6 +128,9 @@ def _rows_for_js(df: pd.DataFrame, status: str, eps_by_symbol: dict) -> list[dic
             "hold_days": int(r.hold_days),
             "pe_at_entry": pe_at_entry,
             "eps_at_entry": eps_at_entry,
+            # Only meaningful for open rows -- a closed trade's RSI
+            # journey is over, so this is None/NaN for those.
+            "rsi_14": round(rsi_now, 1) if pd.notna(rsi_now) else None,
         })
     return out
 
@@ -247,6 +251,7 @@ STYLE = """
   tbody tr:hover { background: var(--accent-soft); }
   .roi.good { color: var(--good); font-weight: 600; }
   .roi.critical { color: var(--critical); font-weight: 600; }
+  .rsi-near-exit { color: var(--accent); font-weight: 600; }
   .tablewrap { overflow-x: auto; }
 
   footer { color: var(--ink-muted); font-size: 0.78rem; margin-top: 36px; border-top: 1px solid var(--border);
@@ -453,14 +458,14 @@ def _table_section(title: str, rows: list[dict], status: str, initial_count: int
     if status == "open":
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("entry_price", "Entry $"),
                 ("exit_price", "Now $"), ("roi", "Unrlzd ROI"), ("hold_days", "Days held"),
-                ("pe_at_entry", "P/E @ entry"), ("eps_at_entry", "EPS @ entry")]
+                ("rsi_14", "RSI now"), ("pe_at_entry", "P/E @ entry"), ("eps_at_entry", "EPS @ entry")]
     else:
         cols = [("symbol", "Symbol"), ("entry_date", "Entry"), ("exit_date", "Exit"),
                 ("entry_price", "Entry $"), ("exit_price", "Exit $"), ("roi", "ROI"),
                 ("hold_days", "Hold days"), ("pe_at_entry", "P/E @ entry"), ("eps_at_entry", "EPS @ entry")]
 
     header_cells = "".join(
-        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days","pe_at_entry","eps_at_entry") else ""}" '
+        f'<th class="{"num" if k in ("entry_price","exit_price","roi","hold_days","rsi_14","pe_at_entry","eps_at_entry") else ""}" '
         f'data-key="{k}" data-tbl="{table_id}">{label}</th>'
         for k, label in cols
     )
@@ -519,6 +524,14 @@ BODY_SCRIPT_TEMPLATE = """
     return (v === null || v === undefined) ? '&mdash;' : v.toFixed(2);
   }
 
+  // RSI exit trigger is >=65 -- highlight a position getting close so it's
+  // not just another number to scan past.
+  function fmtRsi(v) {
+    if (v === null || v === undefined) return '<td class="num">&mdash;</td>';
+    var cls = v >= 60 ? ' class="num rsi-near-exit"' : ' class="num"';
+    return '<td' + cls + '>' + v.toFixed(1) + '</td>';
+  }
+
   function renderTable(tblId, rows, status) {
     var tbody = document.querySelector('#' + tblId + ' tbody');
     tbody.innerHTML = rows.map(function(r) {
@@ -530,6 +543,7 @@ BODY_SCRIPT_TEMPLATE = """
           '<td class="num">' + r.exit_price.toFixed(2) + '</td>' +
           '<td class="num">' + fmtRoi(r.roi) + '</td>' +
           '<td class="num">' + r.hold_days + '</td>' +
+          fmtRsi(r.rsi_14) +
           '<td class="num">' + fmtPe(r.pe_at_entry) + '</td>' +
           '<td class="num">' + fmtEps(r.eps_at_entry) + '</td>' +
           '</tr>';
