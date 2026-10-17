@@ -230,6 +230,10 @@ STYLE = """
                 cursor: pointer; }
   .toggle-btn:hover { color: var(--ink-1); }
   .toggle-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .gh-edit-link { background: var(--bg-page); border: 1px solid var(--border); border-radius: 7px;
+                   color: var(--ink-2); padding: 6px 12px; font-size: 0.82rem; font-family: inherit;
+                   text-decoration: none; margin-left: auto; }
+  .gh-edit-link:hover { color: var(--ink-1); border-color: var(--accent); }
   #liveDateInput { background: var(--bg-page); border: 1px solid var(--border); border-radius: 7px;
                     color: var(--ink-1); padding: 6px 10px; font-size: 0.82rem; font-family: inherit; }
 
@@ -874,6 +878,10 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
       <span>&ndash;</span>
       <input type="number" id="eps-max-global" placeholder="max">
     </label>
+    <a class="gh-edit-link" target="_blank" rel="noopener"
+       href="https://github.com/mkcan1973/method1-rsi-tracker/edit/master/notify_thresholds.json">
+      Edit Discord thresholds &#8599;
+    </a>
   </div>
   <div class="chart-note" style="margin-top:-6px; margin-bottom: 14px;">P/E and EPS filters apply to the stat tiles, chart, and tables below.</div>
 
