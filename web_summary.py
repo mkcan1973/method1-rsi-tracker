@@ -666,22 +666,23 @@ BODY_SCRIPT_TEMPLATE = """
     setTileValue('tileTotalPnl', fmtMoney(totalPnl), totalPnl >= 0 ? 'good num' : 'critical num');
     document.getElementById('tileTotalPnlSub').textContent = 'across ' + WINDOWED.closed.length + ' trades, $1,000 risk each';
 
-    // Chart: no daily price series is shipped for historical years (that's
-    // the whole reason they're static JSON instead of DATA, see
-    // histModeNote), so hide it and show the explanatory note instead.
-    // Live mode: when no P/E filter is active, restore Python's original
-    // (unfiltered) curve exactly rather than recomputing it -- cheaper and
-    // avoids any drift between the two code paths. When a filter IS
-    // active, rebuild realized/unrealized/total from only the trades that
-    // pass it, over the FULL calendar (render() does its own date-window
-    // slicing and rebasing on top of whatever curve it's given).
-    var chartSectionEl = document.getElementById('chartSection');
+    // Chart: historical years get a REALIZED-only cumulative curve built
+    // straight from the already-embedded trade rows (buildHistoricalCurve)
+    // -- no daily price history needed, since nothing in a closed year is
+    // still unrealized. Live mode: when no P/E filter is active, restore
+    // Python's original (unfiltered) curve exactly rather than recomputing
+    // it -- cheaper and avoids any drift between the two code paths. When
+    // a filter IS active, rebuild realized/unrealized/total from only the
+    // trades that pass it, over the FULL calendar (render() does its own
+    // date-window slicing and rebasing on top of whatever curve it's given).
     var histNoteEl = document.getElementById('histModeNote');
     if (histRows) {
-      if (chartSectionEl) chartSectionEl.style.display = 'none';
       if (histNoteEl) histNoteEl.style.display = '';
+      if (window.mtmSetData && window.mtmRender) {
+        window.mtmSetData(buildHistoricalCurve(startStr.slice(0, 4), histRows.filter(peOk)));
+        window.mtmRender(startStr, endStr);
+      }
     } else {
-      if (chartSectionEl) chartSectionEl.style.display = '';
       if (histNoteEl) histNoteEl.style.display = 'none';
       if (window.mtmSetData && window.mtmRender) {
         if (peMin === null && peMax === null) {
@@ -778,6 +779,31 @@ BODY_SCRIPT_TEMPLATE = """
     var curve = new Array(n);
     for (var i = 0; i < n; i++) {
       curve[i] = { date: calendarDates[i], realized: realized[i], unrealized: unrealized[i], total: realized[i] + unrealized[i] };
+    }
+    return curve;
+  }
+
+  // Historical years have no daily price history (that's the whole
+  // reason they're a static trade list, see histModeNote) -- but every
+  // trade in a closed year has a known exit, so there's no "unrealized"
+  // component to plot anyway. Build a daily (calendar, not trading-day)
+  // step curve of CUMULATIVE realized P&L instead, straight from the
+  // already-embedded trade rows. unrealized is always 0 and total always
+  // equals realized -- not a simplification, that's just literally true
+  // once every position in the window has already closed.
+  function buildHistoricalCurve(year, rows) {
+    var byExitDate = {};
+    rows.forEach(function(r) {
+      byExitDate[r.exit_date] = (byExitDate[r.exit_date] || 0) + r.roi * 10;
+    });
+    var curve = [], running = 0;
+    var d = new Date(year + '-01-01T00:00:00Z');
+    var end = new Date(year + '-12-31T00:00:00Z');
+    while (d <= end) {
+      var dateStr = d.toISOString().slice(0, 10);
+      if (byExitDate.hasOwnProperty(dateStr)) { running += byExitDate[dateStr]; }
+      curve.push({ date: dateStr, realized: running, unrealized: 0, total: running });
+      d.setUTCDate(d.getUTCDate() + 1);
     }
     return curve;
   }
@@ -913,9 +939,9 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
   <div id="histModeNote" class="chart-note" style="display:none; margin: 8px 0 14px;">
     Historical year view: every trade is bucketed by its ENTRY year (like a fund's "vintage year" reporting), not by when it
     exited. A position still open at that year's own Dec 31 is marked closed at that date's price, not today's -- this view
-    never changes once the year is over. No daily P&amp;L chart for historical years (would need the full price history kept
-    around just for that, which is what made the live DB too big for GitHub in the first place); the stat tiles and tables
-    below have everything that matters.
+    never changes once the year is over. The chart above shows REALIZED P&amp;L only (no "unrealized" line, since nothing in a
+    closed year is still open) -- built from the trade list itself, not daily price history, which is why a historical year's
+    chart was possible at all without the live DB needing to carry years of price data just for this.
   </div>
 
   {_table_section("Open positions", open_rows, "open", open_count_ytd)}
