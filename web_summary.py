@@ -408,6 +408,25 @@ def _svg_mtm_chart(curve: list[dict], open_mtm_series: dict) -> str:
               '<text x="' + (PAD_L - 8) + '" y="' + (gy + 3).toFixed(1) + '" text-anchor="end" font-size="10" ' +
               'fill="var(--ink-muted)" class="num">$' + val.toLocaleString('en-US', {{maximumFractionDigits: 0}}) + '</text>';
           }});
+
+          // X-axis: a tick + month label at Jan/Apr/Jul/Oct, whenever the
+          // displayed window crosses into one of those months (fires once
+          // per occurrence, so a multi-year window gets one set of labels
+          // per year rather than just the first).
+          var monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+          var lastMonth = null;
+          for (var qi = 0; qi < n; qi++) {{
+            var qMonth = parseInt(current[qi].date.slice(5, 7), 10);
+            if ((qMonth === 1 || qMonth === 4 || qMonth === 7 || qMonth === 10) && qMonth !== lastMonth) {{
+              var qx = x(qi);
+              gridHtml += '<line x1="' + qx.toFixed(1) + '" y1="' + PAD_T + '" x2="' + qx.toFixed(1) + '" y2="' + (H - PAD_B) +
+                '" stroke="var(--grid)" stroke-width="1"/>' +
+                '<text x="' + qx.toFixed(1) + '" y="' + (H - PAD_B + 14) + '" text-anchor="middle" font-size="10" ' +
+                'fill="var(--ink-muted)" class="num">' + monthNames[qMonth - 1] + '</text>';
+            }}
+            lastMonth = qMonth;
+          }}
+
           document.getElementById('mtmGrid').innerHTML = gridHtml;
         }}
 
