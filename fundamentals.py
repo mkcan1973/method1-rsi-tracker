@@ -60,22 +60,26 @@ def get_trailing_eps(symbols: list[str], force_refresh: bool = False) -> dict:
     returned empty results for any symbol added to the universe after
     the cache was built, for up to the full 7-day TTL.
     """
-    cached_eps, attempted = {}, set()
-    if not force_refresh and CACHE_FILE.exists():
+    cached_eps, attempted, cached_at = {}, set(), None
+    if CACHE_FILE.exists():
         try:
             cached = json.loads(CACHE_FILE.read_text())
+            cached_eps = cached["eps"]
+            # Back-compat with caches written before "attempted" existed:
+            # treat every symbol that HAD a value as attempted, but with
+            # no way to know which no-EPS symbols were already tried --
+            # those get harmlessly re-attempted once.
+            attempted = set(cached.get("attempted", cached["eps"].keys()))
             cached_at = datetime.fromisoformat(cached["cached_at"])
-            if _utcnow() - cached_at < timedelta(days=CACHE_MAX_AGE_DAYS):
-                cached_eps = cached["eps"]
-                # Back-compat with caches written before "attempted" existed:
-                # treat every symbol that HAD a value as attempted, but with
-                # no way to know which no-EPS symbols were already tried --
-                # those get harmlessly re-attempted once.
-                attempted = set(cached.get("attempted", cached["eps"].keys()))
         except Exception:
             pass
 
-    missing = [s for s in symbols if force_refresh or s not in attempted]
+    # Loaded regardless of age (unlike before) -- the existing values are
+    # kept as a fallback even past their normal TTL, in case the refresh
+    # below fails outright (see the outage guard). Staleness only decides
+    # which symbols are due for a refetch.
+    is_stale = force_refresh or cached_at is None or _utcnow() - cached_at >= timedelta(days=CACHE_MAX_AGE_DAYS)
+    missing = list(symbols) if is_stale else [s for s in symbols if s not in attempted]
 
     def _save():
         CACHE_FILE.write_text(json.dumps(
@@ -84,8 +88,11 @@ def get_trailing_eps(symbols: list[str], force_refresh: bool = False) -> dict:
     def _fetch_one(symbol):
         return yf.Ticker(symbol).info.get("trailingEps")
 
-    if missing:
-        print(f"  Fetching trailing EPS for {len(missing)} symbols (timeout {PER_SYMBOL_TIMEOUT_SECONDS}s each)...")
+    if not missing:
+        return cached_eps
+
+    print(f"  Fetching trailing EPS for {len(missing)} symbols (timeout {PER_SYMBOL_TIMEOUT_SECONDS}s each)...")
+    successes = 0
     # A pool bigger than 1 matters here: .result(timeout=...) only makes
     # the CALLER stop waiting -- it can't actually kill a thread that's
     # truly stuck in a blocking socket read, so that thread (and its one
@@ -100,15 +107,32 @@ def get_trailing_eps(symbols: list[str], force_refresh: bool = False) -> dict:
                 val = executor.submit(_fetch_one, symbol).result(timeout=PER_SYMBOL_TIMEOUT_SECONDS)
                 if val is not None:
                     cached_eps[symbol] = val
+                    successes += 1
             except FutureTimeoutError:
                 print(f"  WARNING: {symbol} timed out after {PER_SYMBOL_TIMEOUT_SECONDS}s -- skipping.")
             except Exception:
                 pass
             attempted.add(symbol)
+
+            # Yahoo occasionally rejects EVERY .info request from this
+            # network (e.g. the 401 "Invalid Crumb" blackout seen from
+            # GitHub's runners starting 2026-11-04) rather than genuinely
+            # having no EPS for 40 symbols in a row -- a healthy run gets
+            # EPS for roughly a third to three-quarters of symbols. Bail
+            # out WITHOUT saving when that happens: keep whatever cache
+            # already exists (even past its normal TTL) rather than
+            # overwrite it with an all-null result, and leave cached_at
+            # untouched so tomorrow's run still sees the cache as stale
+            # and retries automatically -- no 7-day lockout waiting for
+            # the TTL to expire on a cache that's already garbage.
+            if i + 1 >= 40 and successes == 0:
+                print(f"  WARNING: 0/{i + 1} EPS fetches succeeded -- likely a Yahoo-side outage, "
+                      f"not real data absence. Keeping existing cache; will retry next run.")
+                return cached_eps
+
             if (i + 1) % SAVE_EVERY == 0:
                 _save()
-                print(f"  ...{i + 1}/{len(missing)} symbols attempted, {len(cached_eps)} with EPS so far")
+                print(f"  ...{i + 1}/{len(missing)} symbols attempted, {successes} with EPS so far")
 
-    if missing:
-        _save()
+    _save()
     return cached_eps
