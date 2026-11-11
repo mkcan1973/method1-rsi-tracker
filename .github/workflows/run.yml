@@ -6,15 +6,11 @@ name: Run method1 RSI Tracker
     # prices (RSI computed from each day's close), so there's no benefit
     # to running more than once/day; it literally can't change until the
     # next close exists.
-    # ~20:4x UTC = 4:4xpm EDT (after the 4pm ET close) / 3:4xpm EST
-    # (BEFORE the 4pm ET close -- cron is fixed UTC and doesn't shift for
-    # US daylight saving) -- not worth a second seasonal cron for that.
-    # Minute deliberately NOT :00/:15/:30/:45: GitHub's scheduler queues
-    # workflows behind everyone else's at those popular marks, and this
-    # repo's runs were landing 4-6+ hours late by early Nov 2026 sitting
-    # on :30. An odd minute doesn't guarantee punctuality -- GitHub's
-    # cron is "best effort," full stop -- but it's queued behind less.
-    - cron: "41 20 * * 1-5"
+    # 20:30 UTC = 4:30pm EDT / 3:30pm EST -- after the 4pm ET close, so
+    # Yahoo has posted final closing data. Cron is fixed UTC and doesn't
+    # shift for US daylight saving, so this lands ~30min before close
+    # during EST (Nov-Mar) -- not worth a second seasonal cron for that.
+    - cron: "30 20 * * 1-5"
   workflow_dispatch: {}  # manual trigger from the Actions tab
 
 permissions:
