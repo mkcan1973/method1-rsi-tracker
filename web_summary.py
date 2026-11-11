@@ -14,6 +14,7 @@ doctype/html/head wrapper) for publishing as a Claude Artifact.
 """
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -520,6 +521,10 @@ BODY_SCRIPT_TEMPLATE = """
   // for GitHub's 100MB push limit once Russell 2000 was added.
   window.HIST_DATA = {hist_data_json};
   var TODAY = "{today}";
+  // UTC build timestamp -- rendered via toLocaleString() below so it
+  // shows up in whichever timezone the viewer's own browser is set to,
+  // rather than us hardcoding an offset that breaks across DST.
+  var GENERATED_AT = "{generated_at}";
   // The window-filtered (by the shared toggle) subset each table/tile
   // actually reads from -- separate from DATA itself, which always holds
   // the complete, unfiltered dataset so any window can be re-selected.
@@ -873,6 +878,12 @@ BODY_SCRIPT_TEMPLATE = """
   // Default view: current year to date.
   setActiveToggle(document.querySelector('.toggle-btn[data-range="ytd"]'));
   applyDateWindow(TODAY.slice(0, 4) + '-01-01', null);
+
+  // Confirms the page actually refreshed (vs. a stale cached/undeployed
+  // copy) -- shown in the viewer's own local time, not UTC, since that's
+  // what "did it update today" actually means to a human reading it.
+  var lastRunEl = document.getElementById('lastRun');
+  if (lastRunEl) lastRunEl.textContent = 'Last run: ' + new Date(GENERATED_AT).toLocaleString();
 </script>
 """
 
@@ -880,7 +891,7 @@ BODY_SCRIPT_TEMPLATE = """
 def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
                open_count_ytd: int, closed_count_ytd: int,
                mtm_curve: list[dict], open_mtm_series: dict, today: str,
-               hist_rows: dict | None = None) -> str:
+               generated_at: str, hist_rows: dict | None = None) -> str:
     win_rate = stats["win_rate"] or 0
     avg_roi_closed = (stats["avg_roi_closed"] or 0) * 100
     avg_roi_open = (stats["avg_roi_open"] or 0) * 100
@@ -905,7 +916,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
 <div class="wrap">
   <h1>RSI Trade Log</h1>
   <div class="subtitle">RSI(14) mean reversion &middot; S&amp;P 500 + core ETFs/index</div>
-  <div class="asof">As of {today} &middot; signal only, no orders placed &middot; normalized to $1,000 risked per trade</div>
+  <div class="asof">As of {today} &middot; signal only, no orders placed &middot; normalized to $1,000 risked per trade &middot; <span id="lastRun">Last run: &mdash;</span></div>
 
   <div class="togglebar">
     {hist_year_buttons}
@@ -982,7 +993,7 @@ def build_body(stats: dict, open_rows: list[dict], closed_rows: list[dict],
     treated as having a P/E or EPS of zero.
   </footer>
 </div>
-{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{hist_data_json}", hist_data_json).replace("{today}", today)}
+{BODY_SCRIPT_TEMPLATE.replace("{data_json}", data_json).replace("{hist_data_json}", hist_data_json).replace("{today}", today).replace("{generated_at}", generated_at)}
 """
 
 
@@ -999,6 +1010,7 @@ def main():
 
     today_ts = pd.Timestamp.today().normalize()
     today = today_ts.strftime("%Y-%m-%d")
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ytd_start = pd.Timestamp(year=today_ts.year, month=1, day=1)
     log_ytd = log[(log["status"] == "open") & (log["entry_date"] >= ytd_start)
                   | (log["status"] == "closed") & (log["exit_date"] >= ytd_start)]
@@ -1014,7 +1026,7 @@ def main():
     hist_rows = get_historical_rows()
 
     body = build_body(stats, open_rows, closed_rows, open_count_ytd, closed_count_ytd, mtm_curve, open_mtm_series,
-                       today, hist_rows)
+                       today, generated_at, hist_rows)
 
     full_html = f"""<!DOCTYPE html>
 <html lang="en">
